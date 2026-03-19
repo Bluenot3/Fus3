@@ -1,0 +1,29 @@
+﻿@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: dark;
+}
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background:
+    radial-gradient(circle at 15% 10%, rgba(43, 217, 255, 0.22), transparent 38%),
+    radial-gradient(circle at 85% 90%, rgba(0, 240, 200, 0.14), transparent 30%),
+    linear-gradient(145deg, #04070f 0%, #070f1e 42%, #060b14 100%);
+  color: #d8e7ff;
+  font-family: "Space Grotesk", "IBM Plex Sans", sans-serif;
+}
+
+.grid-overlay {
+  background-image:
+    linear-gradient(rgba(73, 104, 168, 0.17) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(73, 104, 168, 0.17) 1px, transparent 1px);
+  background-size: 28px 28px;
+}
+
+.glass-panel {
+  @apply border border-zen-edge/70 bg-zen-panel/65 shadow-glass backdrop-blur-sm;
+}

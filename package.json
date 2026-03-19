@@ -1,0 +1,47 @@
+{
+  "name": "zen-command-center",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "dev:ws": "node realtime/mock-stream-server.js",
+    "build": "next build",
+    "start": "next start",
+    "telegram:runner": "node scripts/telegram-polling-runner.js --bot zencosbot",
+    "telegram:start": "node scripts/telegram-runner-control.js start zencosbot",
+    "telegram:stop": "node scripts/telegram-runner-control.js stop zencosbot",
+    "telegram:status": "node scripts/telegram-runner-control.js status zencosbot",
+    "telegram:autostart": "node scripts/telegram-runner-control.js install-autostart zencosbot",
+    "lint": "next lint",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.49.4",
+    "cheerio": "^1.2.0",
+    "clsx": "^2.1.1",
+    "jszip": "^3.10.1",
+    "lucide-react": "^0.462.0",
+    "mammoth": "^1.12.0",
+    "next": "15.0.3",
+    "pdf-parse": "^2.4.5",
+    "pdfkit": "^0.18.0",
+    "pst-extractor": "^1.12.0",
+    "react": "18.2.0",
+    "react-dom": "18.2.0",
+    "tesseract.js": "^7.0.0",
+    "turndown": "^7.2.2",
+    "ws": "^8.18.0",
+    "xlsx": "^0.18.5"
+  },
+  "devDependencies": {
+    "@types/node": "^22.9.0",
+    "@types/pdfkit": "^0.17.5",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@types/turndown": "^5.0.6",
+    "autoprefixer": "^10.4.20",
+    "postcss": "^8.4.49",
+    "tailwindcss": "^3.4.15",
+    "typescript": "^5.7.2"
+  }
+}
