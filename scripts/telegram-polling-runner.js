@@ -23,6 +23,7 @@ const BOTS_FILE = path.join(STORAGE_DIR, "bots.json");
 const LOG_DIR = path.join(STORAGE_DIR, "logs");
 const CHAT_DIR = path.join(STORAGE_DIR, "chats");
 const SCHEDULES_FILE = path.join(STORAGE_DIR, "schedules.json");
+const DEVICES_FILE = path.join(STORAGE_DIR, "devices.json");
 const DEFAULT_TIMEOUT_MS = 20000;
 const TELEGRAM_LIMIT = 3900;
 const MAX_HISTORY_MESSAGES = 10;
@@ -207,14 +208,84 @@ function defaultInlineKeyboard() {
   return homeInlineKeyboard();
 }
 
+function navigationScreen(bot, key) {
+  if (key === "dashboard") {
+    return { text: dashboardText(bot), extra: { reply_markup: dashboardInlineKeyboard() } };
+  }
+  if (key === "control") {
+    return { text: "Control panel", extra: { reply_markup: controlInlineKeyboard() } };
+  }
+  if (key === "network") {
+    return { text: "Network panel", extra: { reply_markup: networkInlineKeyboard() } };
+  }
+  if (key === "devices") {
+    return { text: "Devices panel", extra: { reply_markup: devicesInlineKeyboard() } };
+  }
+  if (key === "integrations") {
+    return { text: "Integrations panel", extra: { reply_markup: integrationsInlineKeyboard() } };
+  }
+  if (key === "files") {
+    return { text: "Files panel", extra: { reply_markup: projectInlineKeyboard() } };
+  }
+  if (key === "schedules") {
+    return { text: "Schedules panel", extra: { reply_markup: scheduleInlineKeyboard() } };
+  }
+  return { text: dashboardText(bot), extra: { reply_markup: dashboardInlineKeyboard() } };
+}
+
+function dashboardText(bot) {
+  return [
+    `${bot.name} control center`,
+    "",
+    "Use the sections below for network, files, integrations, and scheduling.",
+    "Natural language still works, but the button layout makes the high-value actions much faster."
+  ].join("\n");
+}
+
+function dashboardInlineKeyboard() {
+  return inlineKeyboard([
+    [{ text: "Control", data: "nav:control" }, { text: "Network", data: "nav:network" }],
+    [{ text: "Devices", data: "nav:devices" }, { text: "Integrations", data: "nav:integrations" }],
+    [{ text: "Files", data: "nav:files" }, { text: "Schedules", data: "nav:schedules" }]
+  ]);
+}
+
+function controlInlineKeyboard() {
+  return inlineKeyboard([
+    [{ text: "Status", data: "cmd:status" }, { text: "Health", data: "cmd:health" }],
+    [{ text: "Project", data: "cmd:project" }, { text: "Models", data: "cmd:models" }],
+    [{ text: "Home", data: "nav:dashboard" }]
+  ]);
+}
+
+function integrationsInlineKeyboard() {
+  return inlineKeyboard([
+    [{ text: "Wix", data: "cmd:wix" }, { text: "Notion", data: "cmd:notionstatus" }],
+    [{ text: "Manus", data: "cmd:manuslist" }, { text: "Users", data: "cmd:notionusers" }],
+    [{ text: "Home", data: "nav:dashboard" }]
+  ]);
+}
+
+function devicesInlineKeyboard() {
+  return inlineKeyboard([
+    [{ text: "Known Devices", data: "cmd:devices" }, { text: "Scan LAN", data: "cmd:devicescan" }],
+    [{ text: "Wi-Fi", data: "cmd:wifi" }, { text: "Network", data: "cmd:network" }],
+    [{ text: "Home", data: "nav:dashboard" }]
+  ]);
+}
+
 function replyMarkupForCommand(command, forceInline = false) {
   const inline =
-    command === "wix" || command === "wixcontacts"
+    command === "menu" || command === "dashboard"
+      ? dashboardInlineKeyboard()
+      : command === "wix" || command === "wixcontacts"
       ? wixInlineKeyboard()
       : command === "notionstatus" || command === "notionsearch" || command === "notionopen" || command === "notionpage" || command === "notionappend" || command === "notionappendto" || command === "notioncreate" || command === "notioncreatein" || command === "notionquery" || command === "notionusers"
         ? notionInlineKeyboard()
       : command === "manus" || command === "manusstatus" || command === "manuslist"
         ? manusInlineKeyboard()
+      : command === "devices" || command === "devicescan" || command === "deviceadd" || command === "deviceping" || command === "deviceports" || command === "devicedetail"
+        ? devicesInlineKeyboard()
       : command === "schedules" || command === "scheduleadd" || command === "scheduledelete" || command === "schedulehelp"
         ? scheduleInlineKeyboard()
       : command === "network" || command === "wifi" || command === "ping" || command === "ports"
@@ -249,6 +320,21 @@ async function readSchedules() {
 async function writeSchedules(schedules) {
   await fsp.mkdir(STORAGE_DIR, { recursive: true });
   await fsp.writeFile(SCHEDULES_FILE, JSON.stringify({ schedules }, null, 2), "utf8");
+}
+
+async function readDevices() {
+  try {
+    const raw = await fsp.readFile(DEVICES_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed.devices) ? parsed.devices : [];
+  } catch {
+    return [];
+  }
+}
+
+async function writeDevices(devices) {
+  await fsp.mkdir(STORAGE_DIR, { recursive: true });
+  await fsp.writeFile(DEVICES_FILE, JSON.stringify({ devices }, null, 2), "utf8");
 }
 
 function resolveBotArg() {
@@ -615,6 +701,155 @@ async function currentWifiInfo() {
     `Public IP: ${publicIp.stdout || "unknown"}`,
     savedNetworks.length ? `Saved networks:\n${savedNetworks.map((name) => `- ${name}`).join("\n")}` : "Saved networks: none found"
   ].join("\n"));
+}
+
+async function getNetworkContext() {
+  const [gateway, ipAddress] = await Promise.all([
+    shellExec("(Get-NetRoute -DestinationPrefix '0.0.0.0/0' | Sort-Object RouteMetric | Select-Object -First 1 -ExpandProperty NextHop)", ROOT),
+    shellExec("(Get-NetIPAddress -AddressFamily IPv4 | Where-Object {$_.IPAddress -notlike '169.*' -and $_.IPAddress -notlike '127.*'} | Select-Object -First 1 -ExpandProperty IPAddress)", ROOT)
+  ]);
+
+  const currentIp = (ipAddress.stdout || "").trim();
+  const subnetPrefix = currentIp ? currentIp.split(".").slice(0, 3).join(".") : "";
+  return {
+    gateway: (gateway.stdout || "").trim(),
+    currentIp,
+    subnetPrefix
+  };
+}
+
+function describeDevice(device) {
+  return [
+    `#${device.shortId} ${device.name}`,
+    `IP: ${device.ip || "unknown"}`,
+    `Source: ${device.source || "manual"}`,
+    device.description ? `Notes: ${device.description}` : null,
+    device.lastSeenAt ? `Last seen: ${device.lastSeenAt}` : null
+  ].filter(Boolean).join("\n");
+}
+
+async function scanNetworkDevices() {
+  const context = await getNetworkContext();
+  if (!context.subnetPrefix) {
+    throw new Error("Could not determine the active subnet.");
+  }
+
+  const command = [
+    `$prefix='${context.subnetPrefix}'`,
+    "$targets = 1..24 | ForEach-Object { \"$prefix.$_\" }",
+    "$live = foreach ($ip in $targets) { if (Test-Connection -Count 1 -Quiet -TimeoutSeconds 1 $ip) { $ip } }",
+    "$live | ForEach-Object { $_ }"
+  ].join("; ");
+  const result = await shellExec(command, ROOT);
+  const ips = result.stdout ? result.stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean) : [];
+  const arp = await shellExec("arp -a", ROOT);
+
+  const devices = ips.map((ip) => {
+    const arpLine = (arp.stdout || "").split(/\r?\n/).find((line) => line.includes(ip)) || "";
+    const mac = arpLine.trim().split(/\s+/)[1] || "";
+    return {
+      id: makeId("device"),
+      shortId: ip.split(".").pop(),
+      name: `LAN ${ip}`,
+      ip,
+      mac,
+      source: "scan",
+      description: "",
+      lastSeenAt: nowIso()
+    };
+  });
+
+  const existing = await readDevices();
+  const merged = [...existing.filter((device) => device.source !== "scan"), ...devices];
+  await writeDevices(merged);
+
+  return truncateForTelegram([
+    `Scanned subnet ${context.subnetPrefix}.0/24`,
+    `Gateway: ${context.gateway || "unknown"}`,
+    "",
+    ...(devices.length
+      ? devices.slice(0, 20).map((device) => `- ${device.ip}${device.mac ? ` | ${device.mac}` : ""}`)
+      : ["No live devices found in the quick scan window."])
+  ].join("\n"));
+}
+
+async function listDevices() {
+  const devices = await readDevices();
+  if (!devices.length) {
+    return "No known devices yet.\n\nUse /devicescan or /deviceadd name | ip | notes";
+  }
+  return truncateForTelegram([
+    "Known devices",
+    "",
+    ...devices.slice(0, 20).map((device) => describeDevice(device))
+  ].join("\n\n"));
+}
+
+async function addDevice(args) {
+  const [rawName, rawIp, ...rest] = String(args || "").split("|");
+  const name = String(rawName || "").trim();
+  const ip = String(rawIp || "").trim();
+  const description = rest.join("|").trim();
+  if (!name || !ip) {
+    throw new Error("Use /deviceadd name | ip | optional notes");
+  }
+
+  const devices = await readDevices();
+  const device = {
+    id: makeId("device"),
+    shortId: makeId("dv").split("-")[1],
+    name,
+    ip,
+    description,
+    source: "manual",
+    lastSeenAt: null,
+    createdAt: nowIso()
+  };
+  devices.push(device);
+  await writeDevices(devices);
+  return `Saved device\n\n${describeDevice(device)}`;
+}
+
+async function resolveDeviceTarget(value) {
+  const target = String(value || "").trim();
+  if (!target) {
+    throw new Error("A device name, short id, or IP is required.");
+  }
+  const devices = await readDevices();
+  return devices.find((device) =>
+    device.shortId === target ||
+    device.ip === target ||
+    (device.name || "").toLowerCase() === target.toLowerCase()
+  ) || null;
+}
+
+async function deviceDetail(args) {
+  const target = await resolveDeviceTarget(args);
+  if (!target) {
+    throw new Error(`Could not find device "${args}".`);
+  }
+  return describeDevice(target);
+}
+
+async function devicePing(args) {
+  const target = (await resolveDeviceTarget(args)) || { ip: String(args || "").trim(), name: String(args || "").trim() };
+  if (!target.ip) {
+    throw new Error("Use /deviceping device-name-or-ip");
+  }
+  const reply = await pingHost(target.ip);
+  const devices = await readDevices();
+  const updated = devices.map((device) => device.ip === target.ip ? { ...device, lastSeenAt: nowIso() } : device);
+  await writeDevices(updated);
+  return truncateForTelegram(`Device: ${target.name || target.ip}\n\n${reply}`);
+}
+
+async function devicePorts(args) {
+  const target = (await resolveDeviceTarget(args)) || { ip: String(args || "").trim(), name: String(args || "").trim() };
+  if (!target.ip) {
+    throw new Error("Use /deviceports device-name-or-ip");
+  }
+  const reply = await scanCommonPorts(target.ip);
+  return truncateForTelegram(`Device: ${target.name || target.ip}\n\n${reply}`);
 }
 
 async function pingHost(rawTarget) {
@@ -1124,6 +1359,7 @@ function helpText(bot) {
     "You can talk normally now, not just with commands.",
     "",
     "/start - show this help",
+    "/dashboard - open the grouped control dashboard",
     "/menu - show the quick action menu again",
     "/status - show current laptop bot status",
     "/health - show connection and runner health",
@@ -1149,6 +1385,12 @@ function helpText(bot) {
     "/wifi - show current Wi-Fi details",
     "/ping host - test a host",
     "/ports host - test common ports",
+    "/devices - list known devices",
+    "/devicescan - quick scan of the local subnet",
+    "/deviceadd name | ip | notes - save a device profile",
+    "/devicedetail name-or-id - show a saved device",
+    "/deviceping name-or-ip - ping a saved device",
+    "/deviceports name-or-ip - scan common ports on a device",
     "/wix - show Wix summary",
     "/wixcontacts - show recent Wix contacts",
     "/notionstatus - check Notion integration health",
@@ -1179,6 +1421,7 @@ function helpText(bot) {
 function telegramCommandList() {
   return [
     { command: "start", description: "Open the main help and controls" },
+    { command: "dashboard", description: "Open the grouped control dashboard" },
     { command: "menu", description: "Show the quick action menu" },
     { command: "status", description: "Show bot and workspace status" },
     { command: "health", description: "Check runner, Wi-Fi, internet, and Ollama" },
@@ -1188,6 +1431,8 @@ function telegramCommandList() {
     { command: "fileinfo", description: "Show file details" },
     { command: "gitstatus", description: "Show git status" },
     { command: "network", description: "Show local network overview" },
+    { command: "devices", description: "List saved and scanned devices" },
+    { command: "devicescan", description: "Quick scan the local subnet" },
     { command: "wifi", description: "Show current Wi-Fi details" },
     { command: "wix", description: "Show Wix site summary" },
     { command: "notionstatus", description: "Check Notion connection" },
@@ -1298,6 +1543,12 @@ async function executeToolAction(bot, action, roots) {
   if (tool === "network_overview") {
     return { tool, result: await networkOverview() };
   }
+  if (tool === "devices_list") {
+    return { tool, result: await listDevices() };
+  }
+  if (tool === "devices_scan") {
+    return { tool, result: await scanNetworkDevices() };
+  }
   if (tool === "wifi_info") {
     return { tool, result: await currentWifiInfo() };
   }
@@ -1361,6 +1612,8 @@ function buildPlannerPrompt(bot, roots, state, userText) {
     "- system_info",
     "- health_summary",
     "- network_overview",
+    "- devices_list",
+    "- devices_scan",
     "- wifi_info",
     "- ping_host with host",
     "- scan_ports with host",
@@ -1586,8 +1839,11 @@ async function processSchedules(bot, token) {
 async function executeTelegramCommand(bot, command, args, roots, chatId) {
   let state = null;
 
-  if (command === "start" || command === "help" || command === "menu") {
+  if (command === "start" || command === "help") {
     return { text: helpText(bot), extra: { reply_markup: commandKeyboard() } };
+  }
+  if (command === "menu" || command === "dashboard") {
+    return { text: dashboardText(bot), extra: { reply_markup: dashboardInlineKeyboard() } };
   }
   if (command === "status") {
     return {
@@ -1666,6 +1922,24 @@ async function executeTelegramCommand(bot, command, args, roots, chatId) {
   }
   if (command === "network") {
     return { text: await networkOverview(), extra: replyMarkupForCommand(command) };
+  }
+  if (command === "devices") {
+    return { text: await listDevices(), extra: replyMarkupForCommand(command) };
+  }
+  if (command === "devicescan") {
+    return { text: await scanNetworkDevices(), extra: replyMarkupForCommand(command) };
+  }
+  if (command === "deviceadd") {
+    return { text: await addDevice(args), extra: replyMarkupForCommand(command) };
+  }
+  if (command === "devicedetail") {
+    return { text: await deviceDetail(args), extra: replyMarkupForCommand(command) };
+  }
+  if (command === "deviceping") {
+    return { text: await devicePing(args), extra: replyMarkupForCommand(command) };
+  }
+  if (command === "deviceports") {
+    return { text: await devicePorts(args), extra: replyMarkupForCommand(command) };
   }
   if (command === "wifi") {
     return { text: await currentWifiInfo(), extra: replyMarkupForCommand(command) };
@@ -1777,7 +2051,9 @@ async function handleCallbackQuery(bot, token, callbackQuery) {
     let response;
 
     if (data === "nav:home") {
-      response = { text: helpText(bot), extra: replyMarkupForCommand("menu", true) };
+      response = navigationScreen(bot, "dashboard");
+    } else if (data.startsWith("nav:")) {
+      response = navigationScreen(bot, data.slice(4));
     } else if (data.startsWith("cmd:")) {
       const commandText = data.slice(4).trim();
       const { command, args } = splitCommand(commandText.startsWith("/") ? commandText : `/${commandText}`);
@@ -1847,6 +2123,9 @@ async function ensureDirs() {
   await fsp.mkdir(CHAT_DIR, { recursive: true });
   if (!fs.existsSync(SCHEDULES_FILE)) {
     await writeSchedules([]);
+  }
+  if (!fs.existsSync(DEVICES_FILE)) {
+    await writeDevices([]);
   }
 }
 
