@@ -1500,6 +1500,36 @@ function userFacingErrorMessage(error) {
   return message;
 }
 
+function fastChatProfile(bot) {
+  const preferred = ["anthropic", "openrouter", "openai", "cohere", "ollama"];
+  const profiles = configuredProviderProfiles(bot);
+  for (const provider of preferred) {
+    const match = profiles.find((profile) => profile.provider === provider);
+    if (match) {
+      return match;
+    }
+  }
+  return null;
+}
+
+function shouldUsePlanner(userText) {
+  const text = String(userText || "").trim();
+  const lower = text.toLowerCase();
+  if (!text) {
+    return false;
+  }
+  if (/^\/\w+/.test(text)) {
+    return false;
+  }
+  if (/[\\/]/.test(text) || /\b(path|file|folder|directory|repo|git|wix|notion|manus|network|wifi|port|ping|schedule|model|provider|task|tasks|document|doc|sheet|code|run|build|create|write|append|read|find|grep|move|copy|zip|analyze|intake|casepack|autopilot|squad|delegate|supervisor)\b/i.test(lower)) {
+    return true;
+  }
+  if (text.length > 280) {
+    return true;
+  }
+  return false;
+}
+
 async function listModels(bot, rawSelector = "") {
   const overrideProfile = rawSelector ? findProfile(bot, rawSelector) : null;
   const { selection, models } = await listProviderModels(bot, overrideProfile ? { profileId: overrideProfile.id } : {});
@@ -3050,12 +3080,41 @@ function buildFinalResponsePrompt(bot, state, userText, toolResults) {
   ].join("\n");
 }
 
+async function handleDirectChat(bot, userText, state) {
+  const history = (state.messages || [])
+    .slice(-6)
+    .map((message) => `${message.role.toUpperCase()}: ${message.content}`)
+    .join("\n");
+  const profile = fastChatProfile(bot);
+  const prompt = [
+    history ? `Recent conversation:\n${history}\n` : "Recent conversation:\n(none)\n",
+    `User message:\n${userText}\n`,
+    "Reply naturally for Telegram.",
+    "Be concise, friendly, and useful.",
+    "If the user seems to want action, mention the most relevant command or task flow briefly."
+  ].join("\n");
+
+  const reply = await askModel(
+    bot,
+    prompt,
+    "You are a responsive Telegram assistant. Keep replies short, clear, and helpful.",
+    profile ? { profileId: profile.id } : undefined
+  );
+  return truncateForTelegram(reply);
+}
+
 async function handleNaturalLanguage(bot, userText, roots, state) {
+  if (!shouldUsePlanner(userText)) {
+    return handleDirectChat(bot, userText, state);
+  }
+
   const plannerPrompt = buildPlannerPrompt(bot, roots, state, userText);
+  const plannerProfile = fastChatProfile(bot);
   const plannerResponse = await askModel(
     bot,
     plannerPrompt,
-    "You are a strict JSON planner. Return JSON only with no markdown fences."
+    "You are a strict JSON planner. Return JSON only with no markdown fences.",
+    plannerProfile ? { profileId: plannerProfile.id } : undefined
   );
 
   let plan;
@@ -3084,7 +3143,8 @@ async function handleNaturalLanguage(bot, userText, roots, state) {
   const finalResponse = await askModel(
     bot,
     buildFinalResponsePrompt(bot, state, userText, toolResults),
-    "You are a concise Telegram assistant. No markdown tables. Keep replies short and useful."
+    "You are a concise Telegram assistant. No markdown tables. Keep replies short and useful.",
+    plannerProfile ? { profileId: plannerProfile.id } : undefined
   );
 
   return truncateForTelegram(finalResponse);
