@@ -3371,6 +3371,11 @@ async function main() {
   if (!bot) {
     throw new Error(`Could not find bot for selector "${botArg || "default"}".`);
   }
+  bot.ollamaModel = bot.ollamaModel || "qwen2.5-coder:7b";
+  bot.aiProviderId = "ollama:local";
+  bot.modelProvider = "ollama";
+  bot.providerProfile = "local";
+  bot.modelName = bot.ollamaModel;
 
   const token = decryptSecret(bot.tokenEncrypted);
   const stateFile = path.join(STORAGE_DIR, `runner-state-${bot.id}.json`);
