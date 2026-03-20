@@ -1,5 +1,6 @@
 const fs = require("fs");
 const fsp = require("fs/promises");
+const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
 const { exec } = require("child_process");
@@ -125,6 +126,7 @@ function commandKeyboard() {
       [{ text: "/files" }, { text: "/project" }, { text: "/wix" }],
       [{ text: "/notionstatus" }, { text: "/notionsearch" }, { text: "/manuslist" }],
       [{ text: "/workbench" }, { text: "/mode build" }, { text: "/devices" }],
+      [{ text: "/intake" }, { text: "/capturedone" }, { text: "/files desktop" }],
       [{ text: "/network" }, { text: "/wifi" }, { text: "/gitstatus" }],
       [{ text: "/schedules" }, { text: "/schedulehelp" }],
       [{ text: "/models" }, { text: "/clear" }]
@@ -286,6 +288,7 @@ function buildInlineKeyboard() {
     [{ text: "Workbench", data: "cmd:workbench" }, { text: "Mode Build", data: "cmd:mode build" }],
     [{ text: "Ideas", data: "cmd:ideas app ideas for my repo" }, { text: "Plan", data: "cmd:planbuild build a new polished dashboard" }],
     [{ text: "HTML", data: "cmd:html scratch\\prototype.html | build a polished landing page" }, { text: "Spec", data: "cmd:spec docs\\idea.md | outline a project spec" }],
+    [{ text: "Start Intake", data: "cmd:intake dispute-case | create a detailed factual plan and draft emails" }, { text: "Desktop Files", data: "cmd:files desktop" }],
     [{ text: "Read Mode", data: "cmd:mode read" }, { text: "Home", data: "nav:dashboard" }]
   ]);
 }
@@ -353,6 +356,25 @@ async function readDevices() {
 async function writeDevices(devices) {
   await fsp.mkdir(STORAGE_DIR, { recursive: true });
   await fsp.writeFile(DEVICES_FILE, JSON.stringify({ devices }, null, 2), "utf8");
+}
+
+function existingRoots(paths) {
+  return [...new Set(paths.filter(Boolean).map((value) => path.resolve(value)).filter((value) => fs.existsSync(value)))];
+}
+
+function desktopCandidates() {
+  const home = os.homedir();
+  return existingRoots([
+    process.env.OneDrive ? path.join(process.env.OneDrive, "Desktop") : "",
+    process.env.OneDrive ? path.join(process.env.OneDrive, "Documents") : "",
+    path.join(home, "Desktop"),
+    path.join(home, "Documents")
+  ]);
+}
+
+function getAllowedRoots(bot) {
+  const configured = Array.isArray(bot.knowledgePaths) && bot.knowledgePaths.length ? bot.knowledgePaths : [ROOT];
+  return existingRoots([...configured, ...desktopCandidates()]);
 }
 
 function resolveBotArg() {
@@ -492,8 +514,20 @@ function resolveAllowedPath(rawValue, roots) {
   if (!value) {
     throw new Error("Path is required.");
   }
+  const desktopRoot = roots.find((root) => root.toLowerCase().endsWith(`${path.sep}desktop`));
+  const documentsRoot = roots.find((root) => root.toLowerCase().endsWith(`${path.sep}documents`));
+  let candidate;
 
-  const candidate = path.isAbsolute(value) ? path.resolve(value) : path.resolve(roots[0], value);
+  if (path.isAbsolute(value)) {
+    candidate = path.resolve(value);
+  } else if (desktopRoot && /^desktop[\\/]/i.test(value)) {
+    candidate = path.resolve(desktopRoot, value.replace(/^desktop[\\/]/i, ""));
+  } else if (documentsRoot && /^documents[\\/]/i.test(value)) {
+    candidate = path.resolve(documentsRoot, value.replace(/^documents[\\/]/i, ""));
+  } else {
+    candidate = path.resolve(roots[0], value);
+  }
+
   if (!isWithinAllowedRoots(candidate, roots)) {
     throw new Error("That path is outside the allowed roots for this bot.");
   }
@@ -1381,6 +1415,29 @@ function withChatMode(state, mode) {
   };
 }
 
+function slugify(value) {
+  return String(value || "")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "")
+    .slice(0, 60) || `file-${Date.now()}`;
+}
+
+function timestampLabel() {
+  const now = new Date();
+  const yyyy = String(now.getFullYear());
+  const mm = String(now.getMonth() + 1).padStart(2, "0");
+  const dd = String(now.getDate()).padStart(2, "0");
+  const hh = String(now.getHours()).padStart(2, "0");
+  const mi = String(now.getMinutes()).padStart(2, "0");
+  return `${yyyy}${mm}${dd}-${hh}${mi}`;
+}
+
+function defaultDesktopIntakePath(roots, label = "intake") {
+  const desktopRoot = roots.find((root) => root.toLowerCase().endsWith(`${path.sep}desktop`)) || roots[0];
+  return path.join(desktopRoot, "ZEN Intake", `${slugify(label)}-${timestampLabel()}.txt`);
+}
+
 async function generateArtifact(bot, prompt, systemPrompt) {
   const output = await askModel(bot, prompt, systemPrompt);
   return String(output || "").replace(/^```[a-zA-Z]*\s*/g, "").replace(/```$/g, "").trim();
@@ -1425,6 +1482,188 @@ async function zipPathCommand(args, roots) {
   const zipTarget = `${target}.zip`;
   await shellExec(`if (Test-Path '${zipTarget.replace(/'/g, "''")}') { Remove-Item '${zipTarget.replace(/'/g, "''")}' -Force }; Compress-Archive -Path '${target.replace(/'/g, "''")}' -DestinationPath '${zipTarget.replace(/'/g, "''")}' -Force`, roots[0]);
   return `Created archive ${zipTarget}`;
+}
+
+function splitIntoChunks(text, maxSize = 7000) {
+  const source = String(text || "");
+  const chunks = [];
+  for (let index = 0; index < source.length; index += maxSize) {
+    chunks.push(source.slice(index, index + maxSize));
+  }
+  return chunks.length ? chunks : [""];
+}
+
+async function summarizeLargeText(bot, text, objective) {
+  const chunks = splitIntoChunks(text, 7000).slice(0, 12);
+  const summaries = [];
+
+  for (let index = 0; index < chunks.length; index += 1) {
+    const chunk = chunks[index];
+    const summary = await askModel(
+      bot,
+      [
+        `Objective: ${objective || "Create a highly detailed factual plan and drafts."}`,
+        `Chunk ${index + 1} of ${chunks.length}`,
+        "",
+        "Extract the most important facts, timeline items, actors, risks, asks, and draftable communications from this text.",
+        "Stay factual and concise.",
+        "",
+        chunk
+      ].join("\n"),
+      "You are a careful strategic analyst. Summarize raw source material into crisp factual bullets for later planning. Do not give legal advice."
+    );
+    summaries.push(`Chunk ${index + 1}\n${summary}`);
+  }
+
+  return summaries.join("\n\n");
+}
+
+async function generateCaseworkPack(bot, roots, sourcePath, objective) {
+  const source = await fsp.readFile(sourcePath, "utf8");
+  const digest = await summarizeLargeText(bot, source, objective);
+  const baseName = sourcePath.replace(/\.[^.]+$/, "");
+
+  const commonPrompt = [
+    `Objective: ${objective || "Create a detailed factual plan, chronology, and ready-to-use drafts."}`,
+    "",
+    "Use the summarized source material below. Be extremely detailed, practical, and organized.",
+    "Keep everything factual, non-defamatory, and focused on documentation, communication, scenario planning, and next steps.",
+    "Do not present legal advice. Do not invent facts.",
+    "",
+    digest
+  ].join("\n");
+
+  const outline = await generateArtifact(
+    bot,
+    `${commonPrompt}\n\nCreate a markdown outline with sections for chronology, main facts, risks, leverage points, evidence to preserve, and next actions.`,
+    "Return only markdown. Write a sharp, highly organized outline for a complex workplace dispute."
+  );
+  const plan = await generateArtifact(
+    bot,
+    `${commonPrompt}\n\nCreate a detailed markdown action plan with immediate steps, 7-day steps, scenario planning, documentation strategy, meeting preparation, and follow-up tasks.`,
+    "Return only markdown. Write an operational plan that a real person can follow under pressure."
+  );
+  const emails = await generateArtifact(
+    bot,
+    `${commonPrompt}\n\nCreate several copy-paste-ready draft emails and messages. Include a factual update email, a clarification request, a confirmation-after-meeting email, and a preservation-of-record style message. Make them professional and calm.`,
+    "Return only markdown. Write polished email drafts that are factual, controlled, and easy to copy and use."
+  );
+  const scenarios = await generateArtifact(
+    bot,
+    `${commonPrompt}\n\nCreate a detailed scenario map covering likely responses from the other side, what each may signal, and how to respond calmly and strategically.`,
+    "Return only markdown. Write a highly practical scenario and response guide."
+  );
+
+  const outputFiles = [
+    `${baseName}-outline.md`,
+    `${baseName}-plan.md`,
+    `${baseName}-emails.md`,
+    `${baseName}-scenarios.md`
+  ];
+
+  await fsp.mkdir(path.dirname(outputFiles[0]), { recursive: true });
+  await fsp.writeFile(outputFiles[0], outline, "utf8");
+  await fsp.writeFile(outputFiles[1], plan, "utf8");
+  await fsp.writeFile(outputFiles[2], emails, "utf8");
+  await fsp.writeFile(outputFiles[3], scenarios, "utf8");
+
+  return {
+    sourcePath,
+    outputFiles
+  };
+}
+
+async function startIntakeSession(args, roots) {
+  const [rawTarget, ...rest] = String(args || "").split("|");
+  const targetOrLabel = String(rawTarget || "").trim();
+  const objective = rest.join("|").trim();
+  const looksLikePath = /[\\/]|\.txt$|\.md$|^desktop[\\/]/i.test(targetOrLabel);
+  const resolvedPath = targetOrLabel
+    ? resolveAllowedPath(looksLikePath ? targetOrLabel : defaultDesktopIntakePath(roots, targetOrLabel), roots)
+    : resolveAllowedPath(defaultDesktopIntakePath(roots), roots);
+
+  await fsp.mkdir(path.dirname(resolvedPath), { recursive: true });
+  await fsp.writeFile(resolvedPath, "", "utf8");
+
+  return {
+    capture: {
+      targetPath: resolvedPath,
+      objective: objective || "Create a detailed factual outline, plan, scenarios, and copy-paste-ready email drafts from this intake.",
+      startedAt: nowIso(),
+      chunks: 0
+    },
+    message: [
+      "Intake capture started.",
+      `File: ${resolvedPath}`,
+      "",
+      "Paste your text in one or more messages.",
+      "When you're done, send /capturedone to generate the strategy pack."
+    ].join("\n")
+  };
+}
+
+async function appendCaptureText(state, text) {
+  const capture = state && state.capture;
+  if (!capture || !capture.targetPath) {
+    throw new Error("No active intake session.");
+  }
+  await fsp.mkdir(path.dirname(capture.targetPath), { recursive: true });
+  await fsp.appendFile(capture.targetPath, `${text}\n\n`, "utf8");
+  return {
+    ...state,
+    capture: {
+      ...capture,
+      chunks: Number(capture.chunks || 0) + 1,
+      updatedAt: nowIso()
+    }
+  };
+}
+
+async function finishCaptureSession(bot, roots, state) {
+  const capture = state && state.capture;
+  if (!capture || !capture.targetPath) {
+    throw new Error("No active intake session.");
+  }
+  const pack = await generateCaseworkPack(bot, roots, capture.targetPath, capture.objective);
+  return {
+    state: {
+      ...state,
+      capture: null
+    },
+    message: [
+      "Intake saved and strategy pack generated.",
+      `Source: ${pack.sourcePath}`,
+      "",
+      ...pack.outputFiles.map((filePath) => `- ${filePath}`)
+    ].join("\n")
+  };
+}
+
+async function cancelCaptureSession(state) {
+  if (!state || !state.capture) {
+    throw new Error("No active intake session.");
+  }
+  return {
+    ...state,
+    capture: null
+  };
+}
+
+async function analyzeFileCommand(bot, roots, args) {
+  const [rawPath, ...rest] = String(args || "").split("|");
+  const targetPath = String(rawPath || "").trim();
+  const objective = rest.join("|").trim();
+  if (!targetPath) {
+    throw new Error("Use /analyze path | objective");
+  }
+  const resolved = resolveAllowedPath(targetPath, roots);
+  const pack = await generateCaseworkPack(bot, roots, resolved, objective);
+  return [
+    "Analysis pack generated.",
+    `Source: ${pack.sourcePath}`,
+    "",
+    ...pack.outputFiles.map((filePath) => `- ${filePath}`)
+  ].join("\n");
 }
 
 async function ideasCommand(bot, prompt) {
@@ -1473,6 +1712,10 @@ function helpText(bot) {
     "/ask prompt - send a prompt to Ollama",
     "/ideas prompt - brainstorm things to build",
     "/planbuild prompt - create a build plan",
+    "/intake name-or-path | objective - start capturing long text into a desktop file",
+    "/capturedone - finish intake and generate plan files",
+    "/capturecancel - cancel the active intake session",
+    "/analyze path | objective - generate a strategy pack from a saved file",
     "/html path | prompt - generate a polished HTML app",
     "/component path | prompt - generate a React component",
     "/route path | prompt - generate a Next.js route",
@@ -1541,6 +1784,8 @@ function telegramCommandList() {
     { command: "wifi", description: "Show current Wi-Fi details" },
     { command: "ideas", description: "Brainstorm things to build" },
     { command: "planbuild", description: "Create a build plan" },
+    { command: "intake", description: "Capture long text into a file" },
+    { command: "capturedone", description: "Finish intake and generate files" },
     { command: "wix", description: "Show Wix site summary" },
     { command: "notionstatus", description: "Check Notion connection" },
     { command: "notionsearch", description: "Search accessible Notion content" },
@@ -1942,7 +2187,7 @@ function scheduleHelpText() {
 
 async function runScheduledPayload(bot, token, schedule) {
   const chatId = schedule.chatId;
-  const roots = Array.isArray(bot.knowledgePaths) && bot.knowledgePaths.length ? bot.knowledgePaths : [ROOT];
+  const roots = getAllowedRoots(bot);
   let state = await readChatState(bot.id, chatId);
   let reply = "";
   let extra = {};
@@ -2091,6 +2336,26 @@ async function executeTelegramCommand(bot, command, args, roots, chatId) {
   }
   if (command === "planbuild") {
     return { text: await planBuildCommand(bot, args), extra: replyMarkupForCommand("workbench") };
+  }
+  if (command === "intake") {
+    const intake = await startIntakeSession(args, roots);
+    state = {
+      ...state,
+      capture: intake.capture,
+      mode: currentChatMode(state)
+    };
+    return { text: intake.message, extra: replyMarkupForCommand("workbench"), state };
+  }
+  if (command === "capturedone") {
+    const finished = await finishCaptureSession(bot, roots, state);
+    return { text: finished.message, extra: replyMarkupForCommand("workbench"), state: finished.state };
+  }
+  if (command === "capturecancel") {
+    state = await cancelCaptureSession(state);
+    return { text: "Intake session cancelled.", extra: replyMarkupForCommand("workbench"), state };
+  }
+  if (command === "analyze") {
+    return { text: await analyzeFileCommand(bot, roots, args), extra: replyMarkupForCommand("workbench") };
   }
   if (command === "html") {
     return {
@@ -2282,7 +2547,7 @@ async function handleCallbackQuery(bot, token, callbackQuery) {
       text: "Working on it..."
     }).catch(() => {});
 
-    const roots = Array.isArray(bot.knowledgePaths) && bot.knowledgePaths.length ? bot.knowledgePaths : [ROOT];
+    const roots = getAllowedRoots(bot);
     let response;
 
     if (data === "nav:home") {
@@ -2321,14 +2586,18 @@ async function handleMessage(bot, token, message) {
     return;
   }
 
-  const roots = Array.isArray(bot.knowledgePaths) && bot.knowledgePaths.length ? bot.knowledgePaths : [ROOT];
+  const roots = getAllowedRoots(bot);
   let state = await readChatState(bot.id, chatId);
 
   try {
     let reply = "";
     let extra = {};
 
-    if (text.startsWith("/")) {
+    if (!text.startsWith("/") && state.capture && state.capture.targetPath) {
+      state = await appendCaptureText(state, text);
+      reply = `Captured chunk ${state.capture.chunks} to ${state.capture.targetPath}\n\nSend /capturedone when you're ready for the plan pack.`;
+      extra = replyMarkupForCommand("workbench");
+    } else if (text.startsWith("/")) {
       const { command, args } = splitCommand(text);
       const response = await executeTelegramCommand(bot, command, args, roots, chatId);
       reply = response.text;
