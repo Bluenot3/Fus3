@@ -164,6 +164,7 @@ function commandKeyboard() {
       [{ text: "/intake" }, { text: "/capturedone" }, { text: "/files desktop" }],
       [{ text: "/network" }, { text: "/wifi" }, { text: "/gitstatus" }],
       [{ text: "/providers" }, { text: "/models" }, { text: "/tasks" }],
+      [{ text: "/autopilot" }, { text: "/squad" }, { text: "/capabilities" }],
       [{ text: "/schedules" }, { text: "/schedulehelp" }, { text: "/clear" }]
     ],
     resize_keyboard: true,
@@ -259,6 +260,8 @@ function tasksInlineKeyboard() {
     [{ text: "Task List", data: "cmd:tasks" }, { text: "Task Help", data: "cmd:agenthelp" }],
     [{ text: "Doc Agent", data: "cmd:docagent desktop\\ZEN Intake\\sample.txt | build a detailed working plan" }],
     [{ text: "Claude Doc", data: "cmd:delegate anthropic | doc | desktop\\ZEN Intake\\sample.txt | build a nuanced structured brief" }],
+    [{ text: "Autopilot", data: "cmd:autopilot doc | desktop\\ZEN Intake\\sample.txt | choose the best agent and build the pack" }],
+    [{ text: "Squad", data: "cmd:squad doc | desktop\\ZEN Intake\\sample.txt | run a multi-agent comparison and synthesis" }],
     [{ text: "Sheet Agent", data: "cmd:sheetagent desktop\\sample.xlsx | summarize this sheet and produce actions" }],
     [{ text: "Site Agent", data: "cmd:siteagent wix | audit the site and suggest upgrades" }],
     [{ text: "Home", data: "nav:dashboard" }]
@@ -357,6 +360,7 @@ function buildInlineKeyboard() {
     [{ text: "Start Intake", data: "cmd:intake dispute-case | create a detailed factual plan and draft emails" }, { text: "Case Pack", data: "cmd:casepack desktop\\ZEN Intake\\sample.txt | build a full case room" }],
     [{ text: "Doc Agent", data: "cmd:docagent desktop\\ZEN Intake\\sample.txt | build a detailed execution pack" }, { text: "Sheet Agent", data: "cmd:sheetagent desktop\\sample.xlsx | turn this sheet into an action plan" }],
     [{ text: "Site Agent", data: "cmd:siteagent wix | audit the site and suggest stronger next steps" }, { text: "Tasks", data: "nav:tasks" }],
+    [{ text: "Autopilot", data: "cmd:autopilot general | desktop\\ZEN Intake\\sample.txt | choose the best provider and build it" }, { text: "Squad", data: "cmd:squad general | desktop\\ZEN Intake\\sample.txt | run a multi-model synthesis" }],
     [{ text: "Desktop Files", data: "cmd:files desktop" }],
     [{ text: "Read Mode", data: "cmd:mode read" }, { text: "Home", data: "nav:dashboard" }]
   ]);
@@ -366,7 +370,7 @@ function replyMarkupForCommand(command, forceInline = false) {
   const inline =
     command === "menu" || command === "dashboard"
       ? dashboardInlineKeyboard()
-      : command === "workbench" || command === "mode" || command === "ideas" || command === "planbuild" || command === "html" || command === "component" || command === "route" || command === "spec" || command === "replace" || command === "zip" || command === "docagent" || command === "sheetagent" || command === "siteagent" || command === "agenttask" || command === "supervisor" || command === "delegate"
+      : command === "workbench" || command === "mode" || command === "ideas" || command === "planbuild" || command === "html" || command === "component" || command === "route" || command === "spec" || command === "replace" || command === "zip" || command === "docagent" || command === "sheetagent" || command === "siteagent" || command === "agenttask" || command === "supervisor" || command === "delegate" || command === "autopilot" || command === "squad" || command === "capabilities"
         ? buildInlineKeyboard()
       : command === "providers" || command === "provider" || command === "models" || command === "model" || command === "modeluse"
         ? aiInlineKeyboard()
@@ -378,7 +382,7 @@ function replyMarkupForCommand(command, forceInline = false) {
         ? manusInlineKeyboard()
       : command === "devices" || command === "devicescan" || command === "deviceadd" || command === "deviceping" || command === "deviceports" || command === "devicedetail"
         ? devicesInlineKeyboard()
-      : command === "tasks" || command === "taskstatus" || command === "tasksend" || command === "taskcancel" || command === "agenthelp"
+      : command === "tasks" || command === "taskstatus" || command === "tasksend" || command === "taskcancel" || command === "agenthelp" || command === "autopilot" || command === "squad"
         ? tasksInlineKeyboard()
       : command === "schedules" || command === "scheduleadd" || command === "scheduledelete" || command === "schedulehelp"
         ? scheduleInlineKeyboard()
@@ -1675,13 +1679,72 @@ function taskTypePrompt(type) {
   return "Analyze the input and produce a high-value brief, a practical plan, and useful deliverables.";
 }
 
+function configuredProviderProfiles(bot) {
+  return describeProfiles(bot).filter((profile) => profile.configured !== false);
+}
+
+function providerPriorityByTask(type) {
+  if (type === "doc") {
+    return ["anthropic", "openai", "openrouter", "cohere", "ollama"];
+  }
+  if (type === "sheet") {
+    return ["openai", "cohere", "openrouter", "anthropic", "ollama"];
+  }
+  if (type === "site") {
+    return ["ollama", "openrouter", "openai", "anthropic", "cohere"];
+  }
+  return ["ollama", "anthropic", "openrouter", "openai", "cohere"];
+}
+
+function recommendedProfiles(bot, type, count = 3) {
+  const configured = configuredProviderProfiles(bot);
+  const priority = providerPriorityByTask(type);
+  const ranked = [];
+  for (const provider of priority) {
+    ranked.push(...configured.filter((profile) => profile.provider === provider));
+  }
+  for (const profile of configured) {
+    if (!ranked.some((entry) => entry.id === profile.id)) {
+      ranked.push(profile);
+    }
+  }
+  return ranked.slice(0, count);
+}
+
+async function resolveProfileModel(bot, profile) {
+  try {
+    const listed = await listProviderModels(bot, { profileId: profile.id });
+    return pickCheapestUsefulModel(profile.provider, listed.models) || profile.defaultModel || "";
+  } catch {
+    return profile.defaultModel || "";
+  }
+}
+
+function capabilitySummaryText(bot) {
+  const current = currentSelection(bot);
+  const providerLine = configuredProviderProfiles(bot)
+    .map((profile) => `${profile.id}${profile.id === current.id ? " [active]" : ""}`)
+    .join(", ");
+  return [
+    "Capabilities",
+    "",
+    `Default supervisor: ollama:local | ${bot.ollamaModel || "qwen2.5-coder:7b"}`,
+    `Current active AI: ${current.id} | ${current.model || "auto"}`,
+    `Providers: ${providerLine}`,
+    "Best task commands: /docagent, /sheetagent, /siteagent, /supervisor, /delegate, /autopilot, /squad",
+    "Useful controls: /providers, /models, /modeluse, /tasks, /taskstatus, /scheduleadd",
+    "Core integrations: files, git, network, Wix, Notion, Manus"
+  ].join("\n");
+}
+
 function describeAgentTask(task) {
   return [
-    `#${task.shortId} ${task.type.toUpperCase()} agent`,
+    `#${task.shortId} ${task.type.toUpperCase()} ${task.mode === "squad" ? "squad" : "agent"}`,
     `Status: ${task.status}`,
     `Target: ${task.target || "prompt only"}`,
     `Objective: ${task.objective}`,
     `AI: ${task.providerLabel || task.providerId || "unknown"} | ${task.model || "auto"}`,
+    Array.isArray(task.providersUsed) && task.providersUsed.length ? `Providers used: ${task.providersUsed.join(", ")}` : null,
     task.outputDir ? `Output: ${task.outputDir}` : null,
     task.startedAt ? `Started: ${task.startedAt}` : null,
     task.completedAt ? `Completed: ${task.completedAt}` : null,
@@ -1714,6 +1777,7 @@ async function createAgentTaskRecord(bot, chatId, type, target, objective) {
     shortId: makeId("job").split("-")[1],
     botId: bot.id,
     chatId: String(chatId),
+    mode: "single",
     type,
     target: String(target || "").trim(),
     objective: String(objective || "").trim() || "Create a practical work pack and actionable next steps.",
@@ -1755,12 +1819,42 @@ async function createAgentTaskRecordWithSelection(bot, chatId, type, target, obj
     shortId: makeId("job").split("-")[1],
     botId: bot.id,
     chatId: String(chatId),
+    mode: "single",
     type,
     target: String(target || "").trim(),
     objective: String(objective || "").trim() || "Create a practical work pack and actionable next steps.",
     providerId: profile.id,
     providerLabel: profile.label,
     model: nextModel,
+    status: "queued",
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+    startedAt: null,
+    completedAt: null,
+    outputDir: "",
+    outputs: [],
+    summary: "",
+    error: ""
+  };
+  const tasks = await readAgentTasks();
+  tasks.push(task);
+  await writeAgentTasks(tasks);
+  return task;
+}
+
+async function createSquadTaskRecord(bot, chatId, type, target, objective) {
+  const task = {
+    id: makeId("task"),
+    shortId: makeId("job").split("-")[1],
+    botId: bot.id,
+    chatId: String(chatId),
+    mode: "squad",
+    type,
+    target: String(target || "").trim(),
+    objective: String(objective || "").trim() || "Run a multi-agent comparison and create a strong consensus work pack.",
+    providerId: "ollama:local",
+    providerLabel: "Squad Supervisor",
+    model: bot.ollamaModel || "qwen2.5-coder:7b",
     status: "queued",
     createdAt: nowIso(),
     updatedAt: nowIso(),
@@ -2071,6 +2165,110 @@ async function runAgentTaskWorkflow(bot, roots, task) {
   };
 }
 
+async function runSingleProviderPass(bot, task, context, profile, outputDir) {
+  const model = await resolveProfileModel(bot, profile);
+  const override = {
+    profileId: profile.id,
+    model
+  };
+  const analysis = await generateArtifact(
+    bot,
+    `${context}\n\nProduce your strongest markdown work product for this assignment. Include diagnosis, recommended strategy, concrete actions, and reusable deliverables.`,
+    "Return only markdown. Produce a practical, detailed, high-value output tuned to your strengths.",
+    override
+  );
+  const target = path.join(outputDir, `${profile.provider}-${slugify(profile.profile || "default")}.md`);
+  await fsp.writeFile(target, analysis, "utf8");
+  return {
+    profileId: profile.id,
+    provider: profile.provider,
+    label: profile.label,
+    model,
+    filePath: target,
+    analysis
+  };
+}
+
+async function runSquadTaskWorkflow(bot, roots, task) {
+  const source = await collectAgentSource(bot, roots, task.type, task.target);
+  const outputDir = defaultDesktopTaskDir(roots, `squad-${task.type}-${task.target || "prompt"}`);
+  const sourceFile = path.join(outputDir, "source.txt");
+  const consensusFile = path.join(outputDir, "consensus.md");
+  const planFile = path.join(outputDir, "execution-plan.md");
+  const comparisonFile = path.join(outputDir, "provider-comparison.md");
+  const handoffFile = path.join(outputDir, "handoff.md");
+  const briefPdfFile = path.join(outputDir, "consensus.pdf");
+  const zipFile = `${outputDir}.zip`;
+  const providersDir = path.join(outputDir, "providers");
+
+  await fsp.mkdir(providersDir, { recursive: true });
+  await fsp.writeFile(sourceFile, `${source.title}\n\n${source.body}`.trim(), "utf8");
+
+  const context = [
+    `Task type: ${task.type}`,
+    `Objective: ${task.objective}`,
+    `Target: ${task.target || "prompt only"}`,
+    `Task guidance: ${taskTypePrompt(task.type)}`,
+    "",
+    "Source material:",
+    source.body || "(no source text provided)"
+  ].join("\n");
+
+  const selectedProfiles = recommendedProfiles(bot, task.type, 3);
+  const providerOutputs = [];
+  for (const profile of selectedProfiles) {
+    providerOutputs.push(await runSingleProviderPass(bot, task, context, profile, providersDir));
+  }
+
+  const combined = providerOutputs
+    .map((output) => [`Provider: ${output.label}`, `Model: ${output.model || "auto"}`, "", output.analysis].join("\n"))
+    .join("\n\n---\n\n");
+
+  const supervisorOverride = {
+    profileId: "ollama:local",
+    model: bot.ollamaModel || "qwen2.5-coder:7b"
+  };
+
+  const consensus = await generateArtifact(
+    bot,
+    `${context}\n\nBelow are several provider outputs for the same assignment.\n\n${combined}\n\nSynthesize them into one strong consensus brief. Highlight agreement, useful disagreements, the best insights, and the recommended final direction.`,
+    "Return only markdown. You are the local supervisor using qwen2.5-coder. Merge multiple model outputs into a coherent, practical brief.",
+    supervisorOverride
+  );
+  const plan = await generateArtifact(
+    bot,
+    `${context}\n\nUsing the provider outputs below, produce a final execution plan with phases, next steps, sequencing, and quick wins.\n\n${combined}`,
+    "Return only markdown. Produce a practical execution plan from multiple agent outputs.",
+    supervisorOverride
+  );
+  const comparison = await generateArtifact(
+    bot,
+    `${context}\n\nCompare the strengths, blind spots, and best use cases of each provider output below. Make it easy for the user to understand why different models were useful.\n\n${combined}`,
+    "Return only markdown. Create a crisp comparison memo across providers.",
+    supervisorOverride
+  );
+  const handoff = await generateArtifact(
+    bot,
+    `${context}\n\nUsing the provider outputs below, create a short handoff note with the exact next actions, files to open, and commands or follow-ups the user should run next.\n\n${combined}`,
+    "Return only markdown. Create a concise operator handoff.",
+    supervisorOverride
+  );
+
+  await fsp.writeFile(consensusFile, consensus, "utf8");
+  await fsp.writeFile(planFile, plan, "utf8");
+  await fsp.writeFile(comparisonFile, comparison, "utf8");
+  await fsp.writeFile(handoffFile, handoff, "utf8");
+  await writeSimplePdf(briefPdfFile, "Squad Consensus Brief", consensus);
+  await shellExec(`if (Test-Path '${zipFile.replace(/'/g, "''")}') { Remove-Item '${zipFile.replace(/'/g, "''")}' -Force }; Compress-Archive -Path '${outputDir.replace(/'/g, "''")}\\*' -DestinationPath '${zipFile.replace(/'/g, "''")}' -Force`, roots[0]);
+
+  return {
+    outputDir,
+    outputs: [sourceFile, consensusFile, planFile, comparisonFile, handoffFile, briefPdfFile, zipFile, ...providerOutputs.map((output) => output.filePath)],
+    summary: consensus.slice(0, 1200),
+    providersUsed: providerOutputs.map((output) => `${output.label} | ${output.model || "auto"}`)
+  };
+}
+
 async function runAgentTaskInBackground(bot, token, taskId) {
   if (ACTIVE_AGENT_TASKS.has(taskId)) {
     return;
@@ -2086,7 +2284,7 @@ async function runAgentTaskInBackground(bot, token, taskId) {
       error: ""
     }));
     const roots = getAllowedRoots(bot);
-    const result = await runAgentTaskWorkflow(bot, roots, task);
+    const result = task.mode === "squad" ? await runSquadTaskWorkflow(bot, roots, task) : await runAgentTaskWorkflow(bot, roots, task);
     task = await updateAgentTask(taskId, (current) => ({
       ...current,
       status: "completed",
@@ -2094,21 +2292,23 @@ async function runAgentTaskInBackground(bot, token, taskId) {
       updatedAt: nowIso(),
       outputDir: result.outputDir,
       outputs: result.outputs,
-      summary: result.summary
+      summary: result.summary,
+      providersUsed: result.providersUsed || current.providersUsed || []
     }));
 
     await sendTelegramText(
       token,
       task.chatId,
       [
-        `Agent task ${task.shortId} finished.`,
+        `${task.mode === "squad" ? "Squad" : "Agent"} task ${task.shortId} finished.`,
         `Type: ${task.type}`,
         `Target: ${task.target || "prompt only"}`,
         `AI: ${task.providerLabel} | ${task.model || "auto"}`,
+        Array.isArray(task.providersUsed) && task.providersUsed.length ? `Providers used:\n- ${task.providersUsed.join("\n- ")}` : null,
         `Output folder: ${task.outputDir}`,
         "",
         truncateForTelegram(task.summary)
-      ].join("\n"),
+      ].filter(Boolean).join("\n"),
       replyMarkupForCommand("tasks")
     );
 
@@ -2156,6 +2356,28 @@ async function startDelegatedTask(bot, token, chatId, providerToken, type, targe
     `AI: ${task.providerLabel} | ${task.model || "auto"}`,
     "",
     "I will supervise the task and report back here when it finishes."
+  ].join("\n");
+}
+
+async function startAutopilotTask(bot, token, chatId, type, target, objective) {
+  const [profile] = recommendedProfiles(bot, type, 1);
+  if (!profile) {
+    throw new Error("No configured AI providers are available for autopilot.");
+  }
+  return startDelegatedTask(bot, token, chatId, profile.id, type, target, objective);
+}
+
+async function startSquadTask(bot, token, chatId, type, target, objective) {
+  const task = await createSquadTaskRecord(bot, chatId, type, target, objective);
+  runAgentTaskInBackground(bot, token, task.id).catch(() => {});
+  return [
+    `Queued squad ${type} task.`,
+    `ID: ${task.shortId}`,
+    `Target: ${task.target || "prompt only"}`,
+    `Supervisor: Ollama local | ${task.model}`,
+    `Recommended squad: ${recommendedProfiles(bot, type, 3).map((profile) => profile.label).join(", ")}`,
+    "",
+    "I will run multiple agents, synthesize the result locally, and follow up here with the final pack."
   ].join("\n");
 }
 
@@ -2255,6 +2477,8 @@ function agentHelpText() {
     "/siteagent wix | audit the site and build a roadmap",
     "/agenttask general | desktop\\notes.txt | turn this into an execution pack",
     "/supervisor doc | desktop\\file.txt | run a managed work pack",
+    "/autopilot doc | desktop\\file.txt | choose the best provider automatically",
+    "/squad doc | desktop\\file.txt | run multiple providers and synthesize the result",
     "/delegate anthropic | doc | desktop\\file.txt | use Claude on this",
     "/tasks",
     "/taskstatus id",
@@ -2356,12 +2580,15 @@ function helpText(bot) {
     "/models [provider] - list models for the current or selected provider",
     "/model name - change the active model on the current provider",
     "/modeluse provider | model - switch provider and model together",
+    "/capabilities - show the current AI/tools capability map",
     "/agenthelp - show the background agent task workflow",
     "/docagent path | objective - run a document agent in the background",
     "/sheetagent path | objective - run a spreadsheet agent in the background",
     "/siteagent wix|url|path | objective - run a site/app agent in the background",
     "/agenttask type | target | objective - queue a general background task",
     "/supervisor type | target | objective - queue a managed work pack on the current AI selection",
+    "/autopilot type | target | objective - automatically choose the best provider for a task",
+    "/squad type | target | objective - run multiple providers and merge the result",
     "/delegate provider | type | target | objective - send a task to a specific provider",
     "/tasks - list agent tasks for this chat",
     "/taskstatus id - inspect one agent task",
@@ -2406,10 +2633,13 @@ function telegramCommandList() {
     { command: "provider", description: "Switch the active AI provider" },
     { command: "models", description: "List models for the active provider" },
     { command: "modeluse", description: "Switch provider and model together" },
+    { command: "capabilities", description: "Show the bot capability map" },
     { command: "docagent", description: "Queue a background document agent" },
     { command: "sheetagent", description: "Queue a background spreadsheet agent" },
     { command: "siteagent", description: "Queue a background site agent" },
     { command: "supervisor", description: "Queue a managed work pack" },
+    { command: "autopilot", description: "Auto-pick the best provider for a task" },
+    { command: "squad", description: "Run a multi-provider squad synthesis" },
     { command: "delegate", description: "Send work to a specific AI provider" },
     { command: "tasks", description: "List background agent tasks" },
     { command: "schedulehelp", description: "Show schedule examples" },
@@ -3147,6 +3377,9 @@ async function executeTelegramCommand(bot, token, command, args, roots, chatId) 
   if (command === "providers") {
     return { text: providersSummary(bot), extra: replyMarkupForCommand(command) };
   }
+  if (command === "capabilities") {
+    return { text: capabilitySummaryText(bot), extra: replyMarkupForCommand(command) };
+  }
   if (command === "provider") {
     const profile = findProfile(bot, args);
     if (!profile) {
@@ -3212,6 +3445,14 @@ async function executeTelegramCommand(bot, token, command, args, roots, chatId) 
   if (command === "supervisor") {
     const parsed = parseAgentTaskArgs(args);
     return { text: await startAgentTask(bot, token, chatId, parsed.type, parsed.target, parsed.objective), extra: replyMarkupForCommand("tasks") };
+  }
+  if (command === "autopilot") {
+    const parsed = parseAgentTaskArgs(args);
+    return { text: await startAutopilotTask(bot, token, chatId, parsed.type, parsed.target, parsed.objective), extra: replyMarkupForCommand("tasks") };
+  }
+  if (command === "squad") {
+    const parsed = parseAgentTaskArgs(args);
+    return { text: await startSquadTask(bot, token, chatId, parsed.type, parsed.target, parsed.objective), extra: replyMarkupForCommand("tasks") };
   }
   if (command === "delegate") {
     const parsed = parseDelegateArgs(args);
