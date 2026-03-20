@@ -4,6 +4,7 @@ const os = require("os");
 const path = require("path");
 const crypto = require("crypto");
 const { exec } = require("child_process");
+const PDFDocument = require("pdfkit");
 const {
   notionSearch,
   notionRetrievePage,
@@ -288,7 +289,8 @@ function buildInlineKeyboard() {
     [{ text: "Workbench", data: "cmd:workbench" }, { text: "Mode Build", data: "cmd:mode build" }],
     [{ text: "Ideas", data: "cmd:ideas app ideas for my repo" }, { text: "Plan", data: "cmd:planbuild build a new polished dashboard" }],
     [{ text: "HTML", data: "cmd:html scratch\\prototype.html | build a polished landing page" }, { text: "Spec", data: "cmd:spec docs\\idea.md | outline a project spec" }],
-    [{ text: "Start Intake", data: "cmd:intake dispute-case | create a detailed factual plan and draft emails" }, { text: "Desktop Files", data: "cmd:files desktop" }],
+    [{ text: "Start Intake", data: "cmd:intake dispute-case | create a detailed factual plan and draft emails" }, { text: "Case Pack", data: "cmd:casepack desktop\\ZEN Intake\\sample.txt | build a full case room" }],
+    [{ text: "Desktop Files", data: "cmd:files desktop" }],
     [{ text: "Read Mode", data: "cmd:mode read" }, { text: "Home", data: "nav:dashboard" }]
   ]);
 }
@@ -1518,10 +1520,29 @@ async function summarizeLargeText(bot, text, objective) {
   return summaries.join("\n\n");
 }
 
+async function writeSimplePdf(filePath, title, body) {
+  await fsp.mkdir(path.dirname(filePath), { recursive: true });
+  await new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ margin: 48, size: "LETTER" });
+    const stream = fs.createWriteStream(filePath);
+    doc.pipe(stream);
+    doc.fontSize(18).text(title || "Report");
+    doc.moveDown();
+    doc.fontSize(10).text(String(body || "").replace(/[#*_`>-]/g, ""), {
+      width: 500,
+      lineGap: 4
+    });
+    doc.end();
+    stream.on("finish", resolve);
+    stream.on("error", reject);
+  });
+}
+
 async function generateCaseworkPack(bot, roots, sourcePath, objective) {
   const source = await fsp.readFile(sourcePath, "utf8");
   const digest = await summarizeLargeText(bot, source, objective);
   const baseName = sourcePath.replace(/\.[^.]+$/, "");
+  const roomDir = `${baseName}-room`;
 
   const commonPrompt = [
     `Objective: ${objective || "Create a detailed factual plan, chronology, and ready-to-use drafts."}`,
@@ -1553,12 +1574,31 @@ async function generateCaseworkPack(bot, roots, sourcePath, objective) {
     `${commonPrompt}\n\nCreate a detailed scenario map covering likely responses from the other side, what each may signal, and how to respond calmly and strategically.`,
     "Return only markdown. Write a highly practical scenario and response guide."
   );
+  const timeline = await generateArtifact(
+    bot,
+    `${commonPrompt}\n\nCreate a detailed chronology and evidence timeline with dated bullets, actors, documents, unresolved questions, and follow-up proof to gather.`,
+    "Return only markdown. Write a strong chronology and evidence timeline."
+  );
+  const brief = await generateArtifact(
+    bot,
+    `${commonPrompt}\n\nCreate a concise but high-impact executive briefing memo that summarizes the issue, current risk, immediate asks, and what to say in the next meeting.`,
+    "Return only markdown. Write a polished executive briefing memo."
+  );
+  const snippets = await generateArtifact(
+    bot,
+    `${commonPrompt}\n\nCreate a practical snippets document with short copy-paste talking points, meeting phrases, boundary-setting lines, and message fragments.`,
+    "Return only markdown. Write quick-use snippets that are calm, factual, and strategic."
+  );
 
   const outputFiles = [
-    `${baseName}-outline.md`,
-    `${baseName}-plan.md`,
-    `${baseName}-emails.md`,
-    `${baseName}-scenarios.md`
+    path.join(roomDir, "outline.md"),
+    path.join(roomDir, "plan.md"),
+    path.join(roomDir, "emails.md"),
+    path.join(roomDir, "scenarios.md"),
+    path.join(roomDir, "timeline.md"),
+    path.join(roomDir, "briefing.md"),
+    path.join(roomDir, "snippets.md"),
+    path.join(roomDir, "briefing.pdf")
   ];
 
   await fsp.mkdir(path.dirname(outputFiles[0]), { recursive: true });
@@ -1566,9 +1606,14 @@ async function generateCaseworkPack(bot, roots, sourcePath, objective) {
   await fsp.writeFile(outputFiles[1], plan, "utf8");
   await fsp.writeFile(outputFiles[2], emails, "utf8");
   await fsp.writeFile(outputFiles[3], scenarios, "utf8");
+  await fsp.writeFile(outputFiles[4], timeline, "utf8");
+  await fsp.writeFile(outputFiles[5], brief, "utf8");
+  await fsp.writeFile(outputFiles[6], snippets, "utf8");
+  await writeSimplePdf(outputFiles[7], "Case Briefing", brief);
 
   return {
     sourcePath,
+    roomDir,
     outputFiles
   };
 }
@@ -1631,8 +1676,9 @@ async function finishCaptureSession(bot, roots, state) {
       capture: null
     },
     message: [
-      "Intake saved and strategy pack generated.",
+      "Intake saved and case room generated.",
       `Source: ${pack.sourcePath}`,
+      `Room: ${pack.roomDir}`,
       "",
       ...pack.outputFiles.map((filePath) => `- ${filePath}`)
     ].join("\n")
@@ -1659,8 +1705,9 @@ async function analyzeFileCommand(bot, roots, args) {
   const resolved = resolveAllowedPath(targetPath, roots);
   const pack = await generateCaseworkPack(bot, roots, resolved, objective);
   return [
-    "Analysis pack generated.",
+    "Case room generated.",
     `Source: ${pack.sourcePath}`,
+    `Room: ${pack.roomDir}`,
     "",
     ...pack.outputFiles.map((filePath) => `- ${filePath}`)
   ].join("\n");
@@ -1715,7 +1762,8 @@ function helpText(bot) {
     "/intake name-or-path | objective - start capturing long text into a desktop file",
     "/capturedone - finish intake and generate plan files",
     "/capturecancel - cancel the active intake session",
-    "/analyze path | objective - generate a strategy pack from a saved file",
+    "/analyze path | objective - generate a full case room from a saved file",
+    "/casepack path | objective - same as /analyze but named for case work",
     "/html path | prompt - generate a polished HTML app",
     "/component path | prompt - generate a React component",
     "/route path | prompt - generate a Next.js route",
@@ -1785,7 +1833,8 @@ function telegramCommandList() {
     { command: "ideas", description: "Brainstorm things to build" },
     { command: "planbuild", description: "Create a build plan" },
     { command: "intake", description: "Capture long text into a file" },
-    { command: "capturedone", description: "Finish intake and generate files" },
+    { command: "capturedone", description: "Finish intake and generate a case room" },
+    { command: "casepack", description: "Generate a case room from a file" },
     { command: "wix", description: "Show Wix site summary" },
     { command: "notionstatus", description: "Check Notion connection" },
     { command: "notionsearch", description: "Search accessible Notion content" },
@@ -2355,6 +2404,9 @@ async function executeTelegramCommand(bot, command, args, roots, chatId) {
     return { text: "Intake session cancelled.", extra: replyMarkupForCommand("workbench"), state };
   }
   if (command === "analyze") {
+    return { text: await analyzeFileCommand(bot, roots, args), extra: replyMarkupForCommand("workbench") };
+  }
+  if (command === "casepack") {
     return { text: await analyzeFileCommand(bot, roots, args), extra: replyMarkupForCommand("workbench") };
   }
   if (command === "html") {
