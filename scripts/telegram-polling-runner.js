@@ -5,6 +5,9 @@ const path = require("path");
 const crypto = require("crypto");
 const { exec } = require("child_process");
 const PDFDocument = require("pdfkit");
+const XLSX = require("xlsx");
+const mammoth = require("mammoth");
+const pdfParse = require("pdf-parse");
 const {
   notionSearch,
   notionRetrievePage,
@@ -18,6 +21,14 @@ const {
   manusGetTask,
   manusListTasks
 } = require("./telegram-external-clients");
+const {
+  currentSelection,
+  describeProfiles,
+  findProfile,
+  generateText,
+  listModels: listProviderModels,
+  pickCheapestUsefulModel
+} = require("./telegram-ai-providers");
 
 const ROOT = process.cwd();
 const STORAGE_DIR = path.join(ROOT, "storage", "telegram");
@@ -26,6 +37,8 @@ const LOG_DIR = path.join(STORAGE_DIR, "logs");
 const CHAT_DIR = path.join(STORAGE_DIR, "chats");
 const SCHEDULES_FILE = path.join(STORAGE_DIR, "schedules.json");
 const DEVICES_FILE = path.join(STORAGE_DIR, "devices.json");
+const AGENT_TASKS_FILE = path.join(STORAGE_DIR, "agent-tasks.json");
+const ACTIVE_AGENT_TASKS = new Set();
 const DEFAULT_TIMEOUT_MS = 20000;
 const TELEGRAM_LIMIT = 3900;
 const MAX_HISTORY_MESSAGES = 10;
@@ -33,6 +46,7 @@ const MAX_TOOL_ACTIONS = 3;
 const SEARCH_RESULT_LIMIT = 25;
 const POLL_BACKOFF_MS = 8000;
 const SCHEDULER_TICK_MS = 15000;
+const TASK_SOURCE_MAX_CHARS = 28000;
 const DANGEROUS_COMMAND_PATTERNS = [
   /\bremove-item\b/i,
   /\bdel\b/i,
@@ -120,6 +134,26 @@ async function sendTelegramText(token, chatId, text, extra = {}) {
   });
 }
 
+async function sendTelegramDocument(token, chatId, filePath, caption = "") {
+  const form = new FormData();
+  const buffer = await fsp.readFile(filePath);
+  form.append("chat_id", String(chatId));
+  if (caption) {
+    form.append("caption", truncateForTelegram(caption));
+  }
+  form.append("document", new Blob([buffer]), path.basename(filePath));
+
+  const response = await fetch(`https://api.telegram.org/bot${token}/sendDocument`, {
+    method: "POST",
+    body: form
+  });
+  const payload = await response.json().catch(() => ({}));
+  if (!response.ok || !payload.ok) {
+    throw new Error(payload.description || `Telegram sendDocument failed for ${path.basename(filePath)}`);
+  }
+  return payload.result;
+}
+
 function commandKeyboard() {
   return {
     keyboard: [
@@ -129,8 +163,8 @@ function commandKeyboard() {
       [{ text: "/workbench" }, { text: "/mode build" }, { text: "/devices" }],
       [{ text: "/intake" }, { text: "/capturedone" }, { text: "/files desktop" }],
       [{ text: "/network" }, { text: "/wifi" }, { text: "/gitstatus" }],
-      [{ text: "/schedules" }, { text: "/schedulehelp" }],
-      [{ text: "/models" }, { text: "/clear" }]
+      [{ text: "/providers" }, { text: "/models" }, { text: "/tasks" }],
+      [{ text: "/schedules" }, { text: "/schedulehelp" }, { text: "/clear" }]
     ],
     resize_keyboard: true,
     is_persistent: true
@@ -155,6 +189,7 @@ function homeInlineKeyboard() {
     [{ text: "Wix", data: "cmd:wix" }, { text: "Notion", data: "cmd:notionstatus" }],
     [{ text: "Workbench", data: "cmd:workbench" }, { text: "Manus", data: "cmd:manuslist" }],
     [{ text: "Network", data: "cmd:network" }, { text: "Mode Build", data: "cmd:mode build" }],
+    [{ text: "Providers", data: "nav:ai" }, { text: "Tasks", data: "nav:tasks" }],
     [{ text: "Schedules", data: "cmd:schedules" }, { text: "Models", data: "cmd:models" }],
     [{ text: "Clear Chat", data: "cmd:clear" }]
   ]);
@@ -209,6 +244,25 @@ function manusInlineKeyboard() {
   ]);
 }
 
+function aiInlineKeyboard() {
+  return inlineKeyboard([
+    [{ text: "Providers", data: "cmd:providers" }, { text: "Models", data: "cmd:models" }],
+    [{ text: "Use Ollama", data: "cmd:provider ollama" }, { text: "Use Cohere", data: "cmd:provider cohere" }],
+    [{ text: "Use OpenAI 1", data: "cmd:provider openai:project1" }, { text: "Use OpenAI 2", data: "cmd:provider openai:project2" }],
+    [{ text: "Tasks", data: "nav:tasks" }, { text: "Home", data: "nav:dashboard" }]
+  ]);
+}
+
+function tasksInlineKeyboard() {
+  return inlineKeyboard([
+    [{ text: "Task List", data: "cmd:tasks" }, { text: "Task Help", data: "cmd:agenthelp" }],
+    [{ text: "Doc Agent", data: "cmd:docagent desktop\\ZEN Intake\\sample.txt | build a detailed working plan" }],
+    [{ text: "Sheet Agent", data: "cmd:sheetagent desktop\\sample.xlsx | summarize this sheet and produce actions" }],
+    [{ text: "Site Agent", data: "cmd:siteagent wix | audit the site and suggest upgrades" }],
+    [{ text: "Home", data: "nav:dashboard" }]
+  ]);
+}
+
 function defaultInlineKeyboard() {
   return homeInlineKeyboard();
 }
@@ -232,8 +286,14 @@ function navigationScreen(bot, key) {
   if (key === "files") {
     return { text: "Files panel", extra: { reply_markup: projectInlineKeyboard() } };
   }
+  if (key === "ai") {
+    return { text: "AI providers panel", extra: { reply_markup: aiInlineKeyboard() } };
+  }
   if (key === "build") {
     return { text: "Build panel", extra: { reply_markup: buildInlineKeyboard() } };
+  }
+  if (key === "tasks") {
+    return { text: "Agent tasks panel", extra: { reply_markup: tasksInlineKeyboard() } };
   }
   if (key === "schedules") {
     return { text: "Schedules panel", extra: { reply_markup: scheduleInlineKeyboard() } };
@@ -245,7 +305,7 @@ function dashboardText(bot) {
   return [
     `${bot.name} control center`,
     "",
-    "Use the sections below for network, files, integrations, and scheduling.",
+    "Use the sections below for network, files, integrations, AI providers, tasks, and scheduling.",
     "Natural language still works, but the button layout makes the high-value actions much faster."
   ].join("\n");
 }
@@ -255,6 +315,7 @@ function dashboardInlineKeyboard() {
     [{ text: "Control", data: "nav:control" }, { text: "Network", data: "nav:network" }],
     [{ text: "Devices", data: "nav:devices" }, { text: "Integrations", data: "nav:integrations" }],
     [{ text: "Files", data: "nav:files" }, { text: "Build", data: "nav:build" }],
+    [{ text: "AI", data: "nav:ai" }, { text: "Tasks", data: "nav:tasks" }],
     [{ text: "Schedules", data: "nav:schedules" }]
   ]);
 }
@@ -263,7 +324,8 @@ function controlInlineKeyboard() {
   return inlineKeyboard([
     [{ text: "Status", data: "cmd:status" }, { text: "Health", data: "cmd:health" }],
     [{ text: "Project", data: "cmd:project" }, { text: "Workbench", data: "cmd:workbench" }],
-    [{ text: "Models", data: "cmd:models" }, { text: "Build Mode", data: "cmd:mode build" }],
+    [{ text: "Models", data: "cmd:models" }, { text: "Providers", data: "cmd:providers" }],
+    [{ text: "Build Mode", data: "cmd:mode build" }, { text: "Tasks", data: "cmd:tasks" }],
     [{ text: "Home", data: "nav:dashboard" }]
   ]);
 }
@@ -272,6 +334,7 @@ function integrationsInlineKeyboard() {
   return inlineKeyboard([
     [{ text: "Wix", data: "cmd:wix" }, { text: "Notion", data: "cmd:notionstatus" }],
     [{ text: "Manus", data: "cmd:manuslist" }, { text: "Users", data: "cmd:notionusers" }],
+    [{ text: "Providers", data: "nav:ai" }, { text: "Tasks", data: "nav:tasks" }],
     [{ text: "Home", data: "nav:dashboard" }]
   ]);
 }
@@ -290,6 +353,8 @@ function buildInlineKeyboard() {
     [{ text: "Ideas", data: "cmd:ideas app ideas for my repo" }, { text: "Plan", data: "cmd:planbuild build a new polished dashboard" }],
     [{ text: "HTML", data: "cmd:html scratch\\prototype.html | build a polished landing page" }, { text: "Spec", data: "cmd:spec docs\\idea.md | outline a project spec" }],
     [{ text: "Start Intake", data: "cmd:intake dispute-case | create a detailed factual plan and draft emails" }, { text: "Case Pack", data: "cmd:casepack desktop\\ZEN Intake\\sample.txt | build a full case room" }],
+    [{ text: "Doc Agent", data: "cmd:docagent desktop\\ZEN Intake\\sample.txt | build a detailed execution pack" }, { text: "Sheet Agent", data: "cmd:sheetagent desktop\\sample.xlsx | turn this sheet into an action plan" }],
+    [{ text: "Site Agent", data: "cmd:siteagent wix | audit the site and suggest stronger next steps" }, { text: "Tasks", data: "nav:tasks" }],
     [{ text: "Desktop Files", data: "cmd:files desktop" }],
     [{ text: "Read Mode", data: "cmd:mode read" }, { text: "Home", data: "nav:dashboard" }]
   ]);
@@ -299,8 +364,10 @@ function replyMarkupForCommand(command, forceInline = false) {
   const inline =
     command === "menu" || command === "dashboard"
       ? dashboardInlineKeyboard()
-      : command === "workbench" || command === "mode" || command === "ideas" || command === "planbuild" || command === "html" || command === "component" || command === "route" || command === "spec" || command === "replace" || command === "zip"
+      : command === "workbench" || command === "mode" || command === "ideas" || command === "planbuild" || command === "html" || command === "component" || command === "route" || command === "spec" || command === "replace" || command === "zip" || command === "docagent" || command === "sheetagent" || command === "siteagent" || command === "agenttask"
         ? buildInlineKeyboard()
+      : command === "providers" || command === "provider" || command === "models" || command === "model" || command === "modeluse"
+        ? aiInlineKeyboard()
       : command === "wix" || command === "wixcontacts"
       ? wixInlineKeyboard()
       : command === "notionstatus" || command === "notionsearch" || command === "notionopen" || command === "notionpage" || command === "notionappend" || command === "notionappendto" || command === "notioncreate" || command === "notioncreatein" || command === "notionquery" || command === "notionusers"
@@ -309,6 +376,8 @@ function replyMarkupForCommand(command, forceInline = false) {
         ? manusInlineKeyboard()
       : command === "devices" || command === "devicescan" || command === "deviceadd" || command === "deviceping" || command === "deviceports" || command === "devicedetail"
         ? devicesInlineKeyboard()
+      : command === "tasks" || command === "taskstatus" || command === "tasksend" || command === "taskcancel" || command === "agenthelp"
+        ? tasksInlineKeyboard()
       : command === "schedules" || command === "scheduleadd" || command === "scheduledelete" || command === "schedulehelp"
         ? scheduleInlineKeyboard()
       : command === "network" || command === "wifi" || command === "ping" || command === "ports"
@@ -358,6 +427,21 @@ async function readDevices() {
 async function writeDevices(devices) {
   await fsp.mkdir(STORAGE_DIR, { recursive: true });
   await fsp.writeFile(DEVICES_FILE, JSON.stringify({ devices }, null, 2), "utf8");
+}
+
+async function readAgentTasks() {
+  try {
+    const raw = await fsp.readFile(AGENT_TASKS_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed.tasks) ? parsed.tasks : [];
+  } catch {
+    return [];
+  }
+}
+
+async function writeAgentTasks(tasks) {
+  await fsp.mkdir(STORAGE_DIR, { recursive: true });
+  await fsp.writeFile(AGENT_TASKS_FILE, JSON.stringify({ tasks }, null, 2), "utf8");
 }
 
 function existingRoots(paths) {
@@ -1074,8 +1158,8 @@ async function systemInfo(bot, roots) {
     `Primary root: ${cwd}`,
     `Node: ${nodeVersion.stdout || "unknown"}`,
     `PowerShell: ${platformInfo.stdout || "unknown"}`,
+    `AI selection: ${selectionSummary(bot)}`,
     `Ollama base: ${bot.ollamaBaseUrl || "not set"}`,
-    `Ollama model: ${bot.ollamaModel || "not set"}`,
     `Allowed roots: ${roots.length}`
   ].join("\n");
 }
@@ -1102,6 +1186,7 @@ async function healthSummary(bot, roots) {
     `Wi-Fi: ${wifi.stdout || "unknown"}`,
     `Internet: ${internetCheck.stdout ? "reachable" : "unconfirmed"}`,
     `Ollama: ${ollamaState}`,
+    `AI selection: ${selectionSummary(bot)}`,
     `Primary root: ${cwd}`
   ].join("\n");
 }
@@ -1363,47 +1448,48 @@ async function manusListCommand() {
   ].join("\n"));
 }
 
-async function listModels(bot) {
-  const response = await fetch(`${String(bot.ollamaBaseUrl || "http://127.0.0.1:11434").replace(/\/+$/, "")}/api/tags`, {
-    method: "GET"
-  });
-  const payload = await response.json();
-  if (!response.ok) {
-    throw new Error(payload.error || "Could not reach Ollama.");
-  }
-  const models = Array.isArray(payload.models) ? payload.models : [];
+function selectionSummary(bot) {
+  const selection = currentSelection(bot);
+  return `${selection.label} | ${selection.model || "auto"}`;
+}
+
+function providersSummary(bot) {
+  const current = currentSelection(bot);
   return [
-    "Available Ollama models:",
+    "Configured AI providers",
     "",
-    ...models.map((model) => `- ${model.name || model.model}`)
+    ...describeProfiles(bot).map((profile) => {
+      const marker = profile.id === current.id ? "*" : "-";
+      return `${marker} ${profile.label} (${profile.id})`;
+    }),
+    "",
+    `Active: ${current.label}`,
+    `Model: ${current.model || "auto-select cheapest useful model"}`
   ].join("\n");
 }
 
-async function askModel(bot, prompt, systemOverride) {
-  if (!bot.ollamaModel) {
-    throw new Error("No Ollama model is configured for this bot yet.");
-  }
+async function listModels(bot, rawSelector = "") {
+  const overrideProfile = rawSelector ? findProfile(bot, rawSelector) : null;
+  const { selection, models } = await listProviderModels(bot, overrideProfile ? { profileId: overrideProfile.id } : {});
+  const current = currentSelection(bot);
+  const activeModel = selection.id === current.id ? current.model : "";
+  return [
+    `Available models for ${selection.label}`,
+    "",
+    ...(models.length
+      ? models.slice(0, 60).map((model) => `${model === activeModel ? "*" : "-"} ${model}`)
+      : ["No models returned."]),
+    "",
+    `Selection key: ${selection.id}`
+  ].join("\n");
+}
+
+async function askModel(bot, prompt, systemOverride, overrideSelection) {
   if (!prompt) {
     throw new Error("Prompt is required.");
   }
-
-  const response = await fetch(`${String(bot.ollamaBaseUrl || "http://127.0.0.1:11434").replace(/\/+$/, "")}/api/generate`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: bot.ollamaModel,
-      system: systemOverride || bot.systemPrompt || "",
-      prompt,
-      stream: false
-    })
-  });
-
-  const payload = await response.json();
-  if (!response.ok || !payload.response) {
-    throw new Error(payload.error || "Ollama request failed.");
-  }
-
-  return String(payload.response).trim();
+  const result = await generateText(bot, prompt, systemOverride, overrideSelection || {});
+  return String(result.text || "").trim();
 }
 
 function currentChatMode(state) {
@@ -1413,7 +1499,8 @@ function currentChatMode(state) {
 function withChatMode(state, mode) {
   return {
     ...(state || { messages: [] }),
-    mode: mode === "build" ? "build" : "read"
+    mode: mode === "build" ? "build" : "read",
+    capture: state && state.capture ? state.capture : null
   };
 }
 
@@ -1440,8 +1527,8 @@ function defaultDesktopIntakePath(roots, label = "intake") {
   return path.join(desktopRoot, "ZEN Intake", `${slugify(label)}-${timestampLabel()}.txt`);
 }
 
-async function generateArtifact(bot, prompt, systemPrompt) {
-  const output = await askModel(bot, prompt, systemPrompt);
+async function generateArtifact(bot, prompt, systemPrompt, overrideSelection) {
+  const output = await askModel(bot, prompt, systemPrompt, overrideSelection);
   return String(output || "").replace(/^```[a-zA-Z]*\s*/g, "").replace(/```$/g, "").trim();
 }
 
@@ -1484,6 +1571,166 @@ async function zipPathCommand(args, roots) {
   const zipTarget = `${target}.zip`;
   await shellExec(`if (Test-Path '${zipTarget.replace(/'/g, "''")}') { Remove-Item '${zipTarget.replace(/'/g, "''")}' -Force }; Compress-Archive -Path '${target.replace(/'/g, "''")}' -DestinationPath '${zipTarget.replace(/'/g, "''")}' -Force`, roots[0]);
   return `Created archive ${zipTarget}`;
+}
+
+function defaultDesktopTaskDir(roots, label = "agent-task") {
+  const desktopRoot = roots.find((root) => root.toLowerCase().endsWith(`${path.sep}desktop`)) || roots[0];
+  return path.join(desktopRoot, "ZEN Agent Jobs", `${slugify(label)}-${timestampLabel()}`);
+}
+
+async function extractSpreadsheetText(filePath) {
+  const workbook = XLSX.readFile(filePath, { cellDates: true });
+  const parts = [];
+  for (const sheetName of workbook.SheetNames.slice(0, 3)) {
+    const rows = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName], { header: 1, raw: false }).slice(0, 40);
+    parts.push(`Sheet: ${sheetName}`);
+    parts.push(
+      rows
+        .map((row) => (Array.isArray(row) ? row.map((cell) => String(cell ?? "")).join("\t") : String(row || "")))
+        .join("\n")
+    );
+  }
+  return parts.join("\n\n").slice(0, TASK_SOURCE_MAX_CHARS);
+}
+
+async function extractPdfText(filePath) {
+  const buffer = await fsp.readFile(filePath);
+  const payload = await pdfParse(buffer);
+  return String(payload.text || "").slice(0, TASK_SOURCE_MAX_CHARS);
+}
+
+async function extractDocxText(filePath) {
+  const payload = await mammoth.extractRawText({ path: filePath });
+  return String(payload.value || "").slice(0, TASK_SOURCE_MAX_CHARS);
+}
+
+async function extractFileText(filePath) {
+  const extension = path.extname(filePath).toLowerCase();
+  if (extension === ".xlsx" || extension === ".xls" || extension === ".csv" || extension === ".tsv") {
+    return extractSpreadsheetText(filePath);
+  }
+  if (extension === ".pdf") {
+    return extractPdfText(filePath);
+  }
+  if (extension === ".docx") {
+    return extractDocxText(filePath);
+  }
+  const buffer = await fsp.readFile(filePath);
+  return buffer.toString("utf8").slice(0, TASK_SOURCE_MAX_CHARS);
+}
+
+async function collectAgentSource(bot, roots, type, target) {
+  const value = String(target || "").trim();
+  if (!value) {
+    return { title: "Prompt-only task", body: "" };
+  }
+
+  if (type === "site" && value.toLowerCase() === "wix") {
+    const [summary, contacts] = await Promise.all([wixSummary(), wixContacts().catch(() => "No recent contacts.")]);
+    return {
+      title: "Wix site context",
+      body: `${summary}\n\n${contacts}`.slice(0, TASK_SOURCE_MAX_CHARS)
+    };
+  }
+
+  if (/^https?:\/\//i.test(value)) {
+    const page = await fetchWebPage(value);
+    return {
+      title: value,
+      body: page.slice(0, TASK_SOURCE_MAX_CHARS)
+    };
+  }
+
+  const resolved = resolveAllowedPath(value, roots);
+  const stats = await fsp.stat(resolved);
+  if (stats.isDirectory()) {
+    const listing = await treeFiles(value, roots);
+    return {
+      title: resolved,
+      body: listing.slice(0, TASK_SOURCE_MAX_CHARS),
+      resolvedPath: resolved
+    };
+  }
+
+  return {
+    title: path.basename(resolved),
+    body: await extractFileText(resolved),
+    resolvedPath: resolved
+  };
+}
+
+function taskTypePrompt(type) {
+  if (type === "doc") {
+    return "Analyze the source document and produce a detailed brief, concrete action plan, deliverable drafts, and a short execution checklist.";
+  }
+  if (type === "sheet") {
+    return "Analyze the spreadsheet data and produce insights, risks, patterns, action recommendations, and a concise operator summary.";
+  }
+  if (type === "site") {
+    return "Analyze the site/app context and produce an audit, improvement roadmap, execution plan, and ready-to-use content ideas.";
+  }
+  return "Analyze the input and produce a high-value brief, a practical plan, and useful deliverables.";
+}
+
+function describeAgentTask(task) {
+  return [
+    `#${task.shortId} ${task.type.toUpperCase()} agent`,
+    `Status: ${task.status}`,
+    `Target: ${task.target || "prompt only"}`,
+    `Objective: ${task.objective}`,
+    `AI: ${task.providerLabel || task.providerId || "unknown"} | ${task.model || "auto"}`,
+    task.outputDir ? `Output: ${task.outputDir}` : null,
+    task.startedAt ? `Started: ${task.startedAt}` : null,
+    task.completedAt ? `Completed: ${task.completedAt}` : null,
+    task.error ? `Error: ${task.error}` : null
+  ].filter(Boolean).join("\n");
+}
+
+async function updateAgentTask(taskId, updater) {
+  const tasks = await readAgentTasks();
+  const index = tasks.findIndex((task) => task.id === taskId);
+  if (index < 0) {
+    throw new Error(`Could not find task ${taskId}`);
+  }
+  tasks[index] = typeof updater === "function" ? updater(tasks[index]) : { ...tasks[index], ...updater };
+  await writeAgentTasks(tasks);
+  return tasks[index];
+}
+
+async function createAgentTaskRecord(bot, chatId, type, target, objective) {
+  const selection = currentSelection(bot);
+  let modelName = selection.model || "";
+  if (!modelName) {
+    try {
+      const listed = await listProviderModels(bot, { profileId: selection.id });
+      modelName = pickCheapestUsefulModel(selection.provider, listed.models) || "";
+    } catch {}
+  }
+  const task = {
+    id: makeId("task"),
+    shortId: makeId("job").split("-")[1],
+    botId: bot.id,
+    chatId: String(chatId),
+    type,
+    target: String(target || "").trim(),
+    objective: String(objective || "").trim() || "Create a practical work pack and actionable next steps.",
+    providerId: selection.id,
+    providerLabel: selection.label,
+    model: modelName,
+    status: "queued",
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+    startedAt: null,
+    completedAt: null,
+    outputDir: "",
+    outputs: [],
+    summary: "",
+    error: ""
+  };
+  const tasks = await readAgentTasks();
+  tasks.push(task);
+  await writeAgentTasks(tasks);
+  return task;
 }
 
 function splitIntoChunks(text, maxSize = 7000) {
@@ -1713,6 +1960,230 @@ async function analyzeFileCommand(bot, roots, args) {
   ].join("\n");
 }
 
+async function runAgentTaskWorkflow(bot, roots, task) {
+  const source = await collectAgentSource(bot, roots, task.type, task.target);
+  const outputDir = defaultDesktopTaskDir(roots, `${task.type}-${task.target || "prompt"}`);
+  const sourceFile = path.join(outputDir, "source.txt");
+  const briefFile = path.join(outputDir, "brief.md");
+  const planFile = path.join(outputDir, "plan.md");
+  const deliverablesFile = path.join(outputDir, "deliverables.md");
+  const checklistFile = path.join(outputDir, "checklist.md");
+  const briefPdfFile = path.join(outputDir, "brief.pdf");
+  const zipFile = `${outputDir}.zip`;
+
+  await fsp.mkdir(outputDir, { recursive: true });
+  await fsp.writeFile(sourceFile, `${source.title}\n\n${source.body}`.trim(), "utf8");
+
+  const context = [
+    `Task type: ${task.type}`,
+    `Objective: ${task.objective}`,
+    `Target: ${task.target || "prompt only"}`,
+    `Task guidance: ${taskTypePrompt(task.type)}`,
+    "",
+    "Source material:",
+    source.body || "(no source text provided)"
+  ].join("\n");
+  const aiOverride = {
+    profileId: task.providerId,
+    model: task.model
+  };
+
+  const brief = await generateArtifact(
+    bot,
+    `${context}\n\nWrite a detailed executive brief in markdown with the current state, what matters most, risks, and best next moves.`,
+    "Return only markdown. Produce a polished, structured brief that is practical and easy to use.",
+    aiOverride
+  );
+  const plan = await generateArtifact(
+    bot,
+    `${context}\n\nWrite a detailed execution plan in markdown with phases, concrete actions, dependencies, and recommended sequencing.`,
+    "Return only markdown. Produce a highly actionable execution plan.",
+    aiOverride
+  );
+  const deliverables = await generateArtifact(
+    bot,
+    `${context}\n\nCreate useful deliverables for this task in markdown. Include drafts, suggested content, tables, templates, or structured outputs the user can reuse immediately.`,
+    "Return only markdown. Produce practical deliverables the user can immediately work from.",
+    aiOverride
+  );
+  const checklist = await generateArtifact(
+    bot,
+    `${context}\n\nCreate a concise operator checklist in markdown with short follow-up items, owners, and completion cues.`,
+    "Return only markdown. Produce a short but sharp checklist.",
+    aiOverride
+  );
+
+  await fsp.writeFile(briefFile, brief, "utf8");
+  await fsp.writeFile(planFile, plan, "utf8");
+  await fsp.writeFile(deliverablesFile, deliverables, "utf8");
+  await fsp.writeFile(checklistFile, checklist, "utf8");
+  await writeSimplePdf(briefPdfFile, `${task.type.toUpperCase()} Agent Brief`, brief);
+  await shellExec(`if (Test-Path '${zipFile.replace(/'/g, "''")}') { Remove-Item '${zipFile.replace(/'/g, "''")}' -Force }; Compress-Archive -Path '${outputDir.replace(/'/g, "''")}\\*' -DestinationPath '${zipFile.replace(/'/g, "''")}' -Force`, roots[0]);
+
+  return {
+    outputDir,
+    outputs: [sourceFile, briefFile, planFile, deliverablesFile, checklistFile, briefPdfFile, zipFile],
+    summary: brief.slice(0, 1200)
+  };
+}
+
+async function runAgentTaskInBackground(bot, token, taskId) {
+  if (ACTIVE_AGENT_TASKS.has(taskId)) {
+    return;
+  }
+  ACTIVE_AGENT_TASKS.add(taskId);
+
+  try {
+    let task = await updateAgentTask(taskId, (current) => ({
+      ...current,
+      status: "running",
+      startedAt: nowIso(),
+      updatedAt: nowIso(),
+      error: ""
+    }));
+    const roots = getAllowedRoots(bot);
+    const result = await runAgentTaskWorkflow(bot, roots, task);
+    task = await updateAgentTask(taskId, (current) => ({
+      ...current,
+      status: "completed",
+      completedAt: nowIso(),
+      updatedAt: nowIso(),
+      outputDir: result.outputDir,
+      outputs: result.outputs,
+      summary: result.summary
+    }));
+
+    await sendTelegramText(
+      token,
+      task.chatId,
+      [
+        `Agent task ${task.shortId} finished.`,
+        `Type: ${task.type}`,
+        `Target: ${task.target || "prompt only"}`,
+        `AI: ${task.providerLabel} | ${task.model || "auto"}`,
+        `Output folder: ${task.outputDir}`,
+        "",
+        truncateForTelegram(task.summary)
+      ].join("\n"),
+      replyMarkupForCommand("tasks")
+    );
+
+    const shareFiles = task.outputs.filter((filePath) => filePath.endsWith(".pdf") || filePath.endsWith(".zip")).slice(0, 2);
+    for (const filePath of shareFiles) {
+      await sendTelegramDocument(token, task.chatId, filePath, `Task ${task.shortId} output: ${path.basename(filePath)}`).catch(() => {});
+    }
+  } catch (error) {
+    const task = await updateAgentTask(taskId, (current) => ({
+      ...current,
+      status: "failed",
+      completedAt: nowIso(),
+      updatedAt: nowIso(),
+      error: error.message || String(error)
+    })).catch(() => null);
+
+    if (task) {
+      await sendTelegramText(token, task.chatId, `Agent task ${task.shortId} failed.\n\n${task.error}`, replyMarkupForCommand("tasks")).catch(() => {});
+    }
+  } finally {
+    ACTIVE_AGENT_TASKS.delete(taskId);
+  }
+}
+
+async function startAgentTask(bot, token, chatId, type, target, objective) {
+  const task = await createAgentTaskRecord(bot, chatId, type, target, objective);
+  runAgentTaskInBackground(bot, token, task.id).catch(() => {});
+  return [
+    `Queued ${type} agent task.`,
+    `ID: ${task.shortId}`,
+    `Target: ${task.target || "prompt only"}`,
+    `AI: ${task.providerLabel} | ${task.model || "auto"}`,
+    "",
+    "I will follow up here in Telegram when the work pack is ready."
+  ].join("\n");
+}
+
+function parseAgentTaskArgs(args, expectedType = "") {
+  const parts = String(args || "").split("|").map((value) => value.trim());
+  if (expectedType) {
+    const target = parts[0] || "";
+    const objective = parts.slice(1).join(" | ").trim();
+    if (!target) {
+      throw new Error(`Use /${expectedType}agent target | objective`);
+    }
+    return { type: expectedType, target, objective };
+  }
+
+  const [type, target, ...rest] = parts;
+  const objective = rest.join(" | ").trim();
+  if (!type || !target) {
+    throw new Error("Use /agenttask doc|sheet|site|general | target | objective");
+  }
+  const normalizedType = type.toLowerCase();
+  if (!["doc", "sheet", "site", "general"].includes(normalizedType)) {
+    throw new Error("Supported agent types: doc, sheet, site, general");
+  }
+  return { type: normalizedType, target, objective };
+}
+
+async function listAgentTasks(bot, chatId) {
+  const tasks = (await readAgentTasks())
+    .filter((task) => task.botId === bot.id && String(task.chatId) === String(chatId))
+    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+  if (!tasks.length) {
+    return "No agent tasks yet.\n\nUse /docagent, /sheetagent, /siteagent, or /agenttask.";
+  }
+  return truncateForTelegram(["Recent agent tasks", "", ...tasks.slice(0, 10).map((task) => describeAgentTask(task))].join("\n\n"));
+}
+
+async function resolveAgentTask(bot, chatId, idArg) {
+  const token = String(idArg || "").trim().replace(/^#/, "");
+  if (!token) {
+    throw new Error("A task id is required.");
+  }
+  const tasks = await readAgentTasks();
+  const task = tasks.find((entry) => entry.botId === bot.id && String(entry.chatId) === String(chatId) && (entry.shortId === token || entry.id === token));
+  if (!task) {
+    throw new Error(`Could not find task ${token}`);
+  }
+  return task;
+}
+
+async function agentTaskStatus(bot, chatId, idArg) {
+  const task = await resolveAgentTask(bot, chatId, idArg);
+  return truncateForTelegram(describeAgentTask(task));
+}
+
+async function resendAgentTaskOutputs(bot, token, chatId, idArg) {
+  const task = await resolveAgentTask(bot, chatId, idArg);
+  if (!Array.isArray(task.outputs) || !task.outputs.length) {
+    throw new Error("That task has no saved outputs yet.");
+  }
+  const shareFiles = task.outputs.filter((filePath) => fs.existsSync(filePath) && (filePath.endsWith(".pdf") || filePath.endsWith(".zip"))).slice(0, 2);
+  for (const filePath of shareFiles) {
+    await sendTelegramDocument(token, chatId, filePath, `Task ${task.shortId} output: ${path.basename(filePath)}`);
+  }
+  return `Re-sent ${shareFiles.length || 0} file outputs for task ${task.shortId}.`;
+}
+
+function agentHelpText() {
+  return [
+    "Agent tasks",
+    "",
+    "/providers",
+    "/provider openai:project1",
+    "/models",
+    "/model gpt-5-mini",
+    "/modeluse cohere | command-r7b-12-2024",
+    "/docagent desktop\\file.txt | build a detailed brief and plan",
+    "/sheetagent desktop\\sheet.xlsx | summarize this data and produce actions",
+    "/siteagent wix | audit the site and build a roadmap",
+    "/agenttask general | desktop\\notes.txt | turn this into an execution pack",
+    "/tasks",
+    "/taskstatus id",
+    "/tasksend id"
+  ].join("\n");
+}
+
 async function ideasCommand(bot, prompt) {
   const text = await askModel(
     bot,
@@ -1802,8 +2273,19 @@ function helpText(bot) {
     "/manusstatus task_id - check a Manus task",
     "/manuslist - list recent Manus tasks",
     "/fetch url - fetch a public webpage",
-    "/models - list Ollama models",
-    "/model name - change the active model",
+    "/providers - list configured AI providers",
+    "/provider name - switch the active provider profile",
+    "/models [provider] - list models for the current or selected provider",
+    "/model name - change the active model on the current provider",
+    "/modeluse provider | model - switch provider and model together",
+    "/agenthelp - show the background agent task workflow",
+    "/docagent path | objective - run a document agent in the background",
+    "/sheetagent path | objective - run a spreadsheet agent in the background",
+    "/siteagent wix|url|path | objective - run a site/app agent in the background",
+    "/agenttask type | target | objective - queue a general background task",
+    "/tasks - list agent tasks for this chat",
+    "/taskstatus id - inspect one agent task",
+    "/tasksend id - resend the main task output files",
     "/schedulehelp - show schedule examples",
     "/scheduleadd when | task - create a schedule",
     "/schedules - list schedules for this chat",
@@ -1840,7 +2322,12 @@ function telegramCommandList() {
     { command: "notionsearch", description: "Search accessible Notion content" },
     { command: "manus", description: "Start a low-cost Manus task" },
     { command: "manuslist", description: "List recent Manus tasks" },
-    { command: "models", description: "List Ollama models" },
+    { command: "providers", description: "List configured AI providers" },
+    { command: "models", description: "List models for the active provider" },
+    { command: "docagent", description: "Queue a background document agent" },
+    { command: "sheetagent", description: "Queue a background spreadsheet agent" },
+    { command: "siteagent", description: "Queue a background site agent" },
+    { command: "tasks", description: "List background agent tasks" },
     { command: "schedulehelp", description: "Show schedule examples" },
     { command: "schedules", description: "List saved schedules" },
     { command: "clear", description: "Clear the current chat memory" }
@@ -1858,10 +2345,11 @@ async function readChatState(botId, chatId) {
     const parsed = JSON.parse(raw);
     return {
       messages: Array.isArray(parsed.messages) ? parsed.messages : [],
-      mode: parsed.mode === "build" ? "build" : "read"
+      mode: parsed.mode === "build" ? "build" : "read",
+      capture: parsed.capture || null
     };
   } catch {
-    return { messages: [], mode: "read" };
+    return { messages: [], mode: "read", capture: null };
   }
 }
 
@@ -1880,7 +2368,8 @@ function pushChatMessage(state, role, content) {
   const next = [...(state.messages || []), { role, content, at: new Date().toISOString() }];
   return {
     messages: next.slice(-MAX_HISTORY_MESSAGES),
-    mode: currentChatMode(state)
+    mode: currentChatMode(state),
+    capture: state.capture || null
   };
 }
 
@@ -1906,7 +2395,7 @@ async function executeToolAction(bot, action, roots, state) {
         `${bot.name} is online.`,
         `Primary root: ${roots[0]}`,
         `Allowed roots: ${roots.length}`,
-        `Ollama model: ${bot.ollamaModel || "not set"}`
+        `AI selection: ${selectionSummary(bot)}`
       ].join("\n")
     };
   }
@@ -2049,6 +2538,7 @@ function buildPlannerPrompt(bot, roots, state, userText) {
     "You are a Telegram laptop assistant with access to local tools.",
     bot.systemPrompt || "",
     `Current mode: ${mode}`,
+    `Current AI selection: ${selectionSummary(bot)}`,
     "",
     "Allowed roots:",
     ...roots.map((root) => `- ${root}`),
@@ -2161,15 +2651,30 @@ async function handleNaturalLanguage(bot, userText, roots, state) {
   return truncateForTelegram(finalResponse);
 }
 
-async function updateBotModel(botId, modelName) {
+async function updateBotAiSettings(botId, updates) {
   const bots = await readBots();
   const index = bots.findIndex((bot) => bot.id === botId);
   if (index < 0) {
     throw new Error("Bot not found.");
   }
-  bots[index].ollamaModel = modelName;
+  bots[index] = {
+    ...bots[index],
+    ...updates
+  };
+  if (updates.modelName) {
+    bots[index].modelName = updates.modelName;
+  }
+  if (updates.aiProviderId) {
+    const [provider, profile] = String(updates.aiProviderId).split(":");
+    bots[index].modelProvider = provider;
+    bots[index].providerProfile = profile || "";
+  }
+  if (updates.modelName && (updates.aiProviderId || "").startsWith("ollama:")) {
+    bots[index].ollamaModel = updates.modelName;
+  }
   bots[index].updatedAt = new Date().toISOString();
   await fsp.writeFile(BOTS_FILE, JSON.stringify({ bots }, null, 2), "utf8");
+  return bots[index];
 }
 
 async function addSchedule(bot, chatId, rawSpec) {
@@ -2243,7 +2748,7 @@ async function runScheduledPayload(bot, token, schedule) {
 
   if (String(schedule.payload || "").trim().startsWith("/")) {
     const { command, args } = splitCommand(schedule.payload);
-    const response = await executeTelegramCommand(bot, command, args, roots, chatId);
+    const response = await executeTelegramCommand(bot, token, command, args, roots, chatId);
     reply = response.text;
     extra = response.extra || {};
     if (response.state) {
@@ -2293,7 +2798,7 @@ async function processSchedules(bot, token) {
   }
 }
 
-async function executeTelegramCommand(bot, command, args, roots, chatId) {
+async function executeTelegramCommand(bot, token, command, args, roots, chatId) {
   let state = await readChatState(bot.id, chatId);
 
   if (command === "start" || command === "help") {
@@ -2319,8 +2824,8 @@ async function executeTelegramCommand(bot, command, args, roots, chatId) {
         `${bot.name} is online.`,
         `Primary root: ${roots[0]}`,
         `Allowed roots: ${roots.length}`,
+        `AI selection: ${selectionSummary(bot)}`,
         `Ollama base: ${bot.ollamaBaseUrl || "not set"}`,
-        `Ollama model: ${bot.ollamaModel || "not set"}`,
         `Mode: ${currentChatMode(state)}`
       ].join("\n"),
       extra: replyMarkupForCommand(command)
@@ -2553,16 +3058,79 @@ async function executeTelegramCommand(bot, command, args, roots, chatId) {
   if (command === "fetch") {
     return { text: await fetchWebPage(args), extra: replyMarkupForCommand(command) };
   }
+  if (command === "providers") {
+    return { text: providersSummary(bot), extra: replyMarkupForCommand(command) };
+  }
+  if (command === "provider") {
+    const profile = findProfile(bot, args);
+    if (!profile) {
+      throw new Error("Use /provider ollama, /provider cohere, /provider openai:project1, or /provider openai:project2");
+    }
+    const listed = await listProviderModels(bot, { profileId: profile.id });
+    const modelName = pickCheapestUsefulModel(profile.provider, listed.models);
+    const updatedBot = await updateBotAiSettings(bot.id, {
+      aiProviderId: profile.id,
+      modelName: modelName || ""
+    });
+    Object.assign(bot, updatedBot);
+    return { text: `Active provider changed to ${profile.label}\nModel: ${modelName || "auto"}`, extra: replyMarkupForCommand(command) };
+  }
   if (command === "models") {
-    return { text: await listModels(bot), extra: replyMarkupForCommand(command) };
+    return { text: await listModels(bot, args), extra: replyMarkupForCommand(command) };
   }
   if (command === "model") {
     if (!args) {
       throw new Error("Use /model model-name");
     }
-    await updateBotModel(bot.id, args);
-    bot.ollamaModel = args;
-    return { text: `Active model changed to ${args}`, extra: replyMarkupForCommand(command) };
+    const updatedBot = await updateBotAiSettings(bot.id, {
+      aiProviderId: currentSelection(bot).id,
+      modelName: args
+    });
+    Object.assign(bot, updatedBot);
+    return { text: `Active model changed to ${args}\nProvider: ${currentSelection(bot).label}`, extra: replyMarkupForCommand(command) };
+  }
+  if (command === "modeluse") {
+    const [rawProvider, ...rest] = String(args || "").split("|");
+    const providerToken = String(rawProvider || "").trim();
+    const modelName = rest.join("|").trim();
+    const profile = findProfile(bot, providerToken);
+    if (!profile || !modelName) {
+      throw new Error("Use /modeluse provider | model");
+    }
+    const updatedBot = await updateBotAiSettings(bot.id, {
+      aiProviderId: profile.id,
+      modelName
+    });
+    Object.assign(bot, updatedBot);
+    return { text: `Active AI selection: ${profile.label} | ${modelName}`, extra: replyMarkupForCommand(command) };
+  }
+  if (command === "agenthelp") {
+    return { text: agentHelpText(), extra: replyMarkupForCommand(command) };
+  }
+  if (command === "docagent") {
+    const parsed = parseAgentTaskArgs(args, "doc");
+    return { text: await startAgentTask(bot, token, chatId, parsed.type, parsed.target, parsed.objective), extra: replyMarkupForCommand("tasks") };
+  }
+  if (command === "sheetagent") {
+    const parsed = parseAgentTaskArgs(args, "sheet");
+    return { text: await startAgentTask(bot, token, chatId, parsed.type, parsed.target, parsed.objective), extra: replyMarkupForCommand("tasks") };
+  }
+  if (command === "siteagent") {
+    const parsed = parseAgentTaskArgs(args, "site");
+    return { text: await startAgentTask(bot, token, chatId, parsed.type, parsed.target, parsed.objective), extra: replyMarkupForCommand("tasks") };
+  }
+  if (command === "agenttask") {
+    const parsed = parseAgentTaskArgs(args);
+    return { text: await startAgentTask(bot, token, chatId, parsed.type, parsed.target, parsed.objective), extra: replyMarkupForCommand("tasks") };
+  }
+  if (command === "tasks") {
+    return { text: await listAgentTasks(bot, chatId), extra: replyMarkupForCommand(command) };
+  }
+  if (command === "taskstatus") {
+    return { text: await agentTaskStatus(bot, chatId, args), extra: replyMarkupForCommand(command) };
+  }
+  if (command === "tasksend") {
+    return { text: await resendAgentTaskOutputs(bot, token, chatId, args), extra: replyMarkupForCommand(command) };
   }
   if (command === "schedulehelp") {
     return { text: scheduleHelpText(), extra: replyMarkupForCommand(command) };
@@ -2578,7 +3146,7 @@ async function executeTelegramCommand(bot, command, args, roots, chatId) {
   }
   if (command === "clear") {
     await clearChatState(bot.id, chatId);
-    state = { messages: [], mode: currentChatMode(state) };
+    state = { messages: [], mode: currentChatMode(state), capture: null };
     return { text: "Chat memory cleared for this conversation.", extra: replyMarkupForCommand(command), state };
   }
 
@@ -2609,7 +3177,7 @@ async function handleCallbackQuery(bot, token, callbackQuery) {
     } else if (data.startsWith("cmd:")) {
       const commandText = data.slice(4).trim();
       const { command, args } = splitCommand(commandText.startsWith("/") ? commandText : `/${commandText}`);
-      response = await executeTelegramCommand(bot, command, args, roots, chatId);
+      response = await executeTelegramCommand(bot, token, command, args, roots, chatId);
     } else {
       response = { text: "That button action is not wired yet.", extra: replyMarkupForCommand("menu", true) };
     }
@@ -2651,7 +3219,7 @@ async function handleMessage(bot, token, message) {
       extra = replyMarkupForCommand("workbench");
     } else if (text.startsWith("/")) {
       const { command, args } = splitCommand(text);
-      const response = await executeTelegramCommand(bot, command, args, roots, chatId);
+      const response = await executeTelegramCommand(bot, token, command, args, roots, chatId);
       reply = response.text;
       extra = response.extra || {};
       if (response.state) {
@@ -2682,6 +3250,9 @@ async function ensureDirs() {
   }
   if (!fs.existsSync(DEVICES_FILE)) {
     await writeDevices([]);
+  }
+  if (!fs.existsSync(AGENT_TASKS_FILE)) {
+    await writeAgentTasks([]);
   }
 }
 
