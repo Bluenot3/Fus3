@@ -179,7 +179,7 @@ function currentSelection(bot, override = {}) {
 async function listModels(bot, override = {}) {
   const selection = currentSelection(bot, override);
   if (selection.provider === "ollama") {
-    const response = await fetchWithTimeout(`${selection.baseUrl}/api/tags`, {}, 8000);
+    const response = await fetchWithTimeout(`${selection.baseUrl}/api/tags`, {}, 15000);
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
       throw new Error(payload.error || "Could not reach Ollama.");
@@ -318,7 +318,7 @@ async function generateText(bot, prompt, systemPrompt, override = {}) {
         prompt,
         stream: false
       })
-    }, 20000);
+    }, 60000);
 
     const payload = await response.json().catch(() => ({}));
     if (!response.ok || !payload.response) {
@@ -355,7 +355,7 @@ async function generateText(bot, prompt, systemPrompt, override = {}) {
         input,
         max_output_tokens: 1800
       })
-    }, 30000);
+    }, 45000);
 
     const payload = await response.json().catch(() => ({}));
     const text = extractOpenAiText(payload);
@@ -394,7 +394,7 @@ async function generateText(bot, prompt, systemPrompt, override = {}) {
         messages,
         max_tokens: 1400
       })
-    }, 30000);
+    }, 45000);
 
     const payload = await response.json().catch(() => ({}));
     const text = payload?.message?.content?.[0]?.text || "";
@@ -427,7 +427,7 @@ async function generateText(bot, prompt, systemPrompt, override = {}) {
           }
         ]
       })
-    }, 30000);
+    }, 45000);
 
     const payload = await response.json().catch(() => ({}));
     const text = (Array.isArray(payload.content) ? payload.content : [])
@@ -470,7 +470,7 @@ async function generateText(bot, prompt, systemPrompt, override = {}) {
         messages,
         max_tokens: 1600
       })
-    }, 30000);
+    }, 45000);
 
     const payload = await response.json().catch(() => ({}));
     const text = payload?.choices?.[0]?.message?.content || "";

@@ -1492,6 +1492,14 @@ function fallbackSelectionChain(bot, currentId = "") {
   return ordered;
 }
 
+function userFacingErrorMessage(error) {
+  const message = error && (error.message || String(error)) ? String(error.message || error) : "Unknown error";
+  if (/aborted|aborterror/i.test(message)) {
+    return "The AI request timed out before a model finished. Try again, or switch to a faster cloud provider with /provider anthropic or /provider openrouter.";
+  }
+  return message;
+}
+
 async function listModels(bot, rawSelector = "") {
   const overrideProfile = rawSelector ? findProfile(bot, rawSelector) : null;
   const { selection, models } = await listProviderModels(bot, overrideProfile ? { profileId: overrideProfile.id } : {});
@@ -1528,7 +1536,7 @@ async function askModel(bot, prompt, systemOverride, overrideSelection) {
         return String(fallback.text || "").trim();
       } catch {}
     }
-    throw error;
+    throw new Error(userFacingErrorMessage(error));
   }
 }
 
@@ -2429,7 +2437,7 @@ async function runAgentTaskInBackground(bot, token, taskId) {
       status: "failed",
       completedAt: nowIso(),
       updatedAt: nowIso(),
-      error: error.message || String(error)
+      error: userFacingErrorMessage(error)
     })).catch(() => null);
 
     if (task) {
@@ -3677,6 +3685,7 @@ async function handleMessage(bot, token, message) {
   try {
     let reply = "";
     let extra = {};
+    await telegram(token, "sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => {});
 
     if (!text.startsWith("/") && state.capture && state.capture.targetPath) {
       state = await appendCaptureText(state, text);
@@ -3695,14 +3704,12 @@ async function handleMessage(bot, token, message) {
       reply = await handleNaturalLanguage(bot, text, roots, state);
       extra = replyMarkupForCommand("menu");
     }
-
-    await telegram(token, "sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => {});
     await sendTelegramText(token, chatId, reply, extra);
 
     state = pushChatMessage(state, "assistant", reply);
     await writeChatState(bot.id, chatId, state);
   } catch (error) {
-    await sendTelegramText(token, chatId, `Error: ${error.message || String(error)}`);
+    await sendTelegramText(token, chatId, `Error: ${userFacingErrorMessage(error)}`);
   }
 }
 
