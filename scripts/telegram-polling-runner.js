@@ -159,6 +159,7 @@ function commandKeyboard() {
     keyboard: [
       [{ text: "/menu" }, { text: "/status" }, { text: "/health" }],
       [{ text: "/files" }, { text: "/project" }, { text: "/wix" }],
+      [{ text: "/docs" }, { text: "/newdoc" }, { text: "/workon" }],
       [{ text: "/notionstatus" }, { text: "/notionsearch" }, { text: "/manuslist" }],
       [{ text: "/workbench" }, { text: "/mode build" }, { text: "/devices" }],
       [{ text: "/intake" }, { text: "/capturedone" }, { text: "/files desktop" }],
@@ -358,6 +359,7 @@ function buildInlineKeyboard() {
     [{ text: "Ideas", data: "cmd:ideas app ideas for my repo" }, { text: "Plan", data: "cmd:planbuild build a new polished dashboard" }],
     [{ text: "HTML", data: "cmd:html scratch\\prototype.html | build a polished landing page" }, { text: "Spec", data: "cmd:spec docs\\idea.md | outline a project spec" }],
     [{ text: "Start Intake", data: "cmd:intake dispute-case | create a detailed factual plan and draft emails" }, { text: "Case Pack", data: "cmd:casepack desktop\\ZEN Intake\\sample.txt | build a full case room" }],
+    [{ text: "New Doc", data: "cmd:newdoc idea-note | created from Telegram" }, { text: "Docs", data: "cmd:docs" }],
     [{ text: "Doc Agent", data: "cmd:docagent desktop\\ZEN Intake\\sample.txt | build a detailed execution pack" }, { text: "Sheet Agent", data: "cmd:sheetagent desktop\\sample.xlsx | turn this sheet into an action plan" }],
     [{ text: "Site Agent", data: "cmd:siteagent wix | audit the site and suggest stronger next steps" }, { text: "Tasks", data: "nav:tasks" }],
     [{ text: "Autopilot", data: "cmd:autopilot general | desktop\\ZEN Intake\\sample.txt | choose the best provider and build it" }, { text: "Squad", data: "cmd:squad general | desktop\\ZEN Intake\\sample.txt | run a multi-model synthesis" }],
@@ -370,7 +372,7 @@ function replyMarkupForCommand(command, forceInline = false) {
   const inline =
     command === "menu" || command === "dashboard"
       ? dashboardInlineKeyboard()
-      : command === "workbench" || command === "mode" || command === "ideas" || command === "planbuild" || command === "html" || command === "component" || command === "route" || command === "spec" || command === "replace" || command === "zip" || command === "docagent" || command === "sheetagent" || command === "siteagent" || command === "agenttask" || command === "supervisor" || command === "delegate" || command === "autopilot" || command === "squad" || command === "capabilities"
+      : command === "workbench" || command === "mode" || command === "ideas" || command === "planbuild" || command === "html" || command === "component" || command === "route" || command === "spec" || command === "replace" || command === "zip" || command === "docagent" || command === "sheetagent" || command === "siteagent" || command === "agenttask" || command === "supervisor" || command === "delegate" || command === "autopilot" || command === "squad" || command === "capabilities" || command === "newdoc" || command === "workon"
         ? buildInlineKeyboard()
       : command === "providers" || command === "provider" || command === "models" || command === "model" || command === "modeluse"
         ? aiInlineKeyboard()
@@ -388,7 +390,7 @@ function replyMarkupForCommand(command, forceInline = false) {
         ? scheduleInlineKeyboard()
       : command === "network" || command === "wifi" || command === "ping" || command === "ports"
         ? networkInlineKeyboard()
-        : command === "files" || command === "find" || command === "grep" || command === "gitstatus" || command === "gitlog" || command === "project"
+        : command === "files" || command === "docs" || command === "viewdoc" || command === "find" || command === "grep" || command === "gitstatus" || command === "gitlog" || command === "project"
           ? projectInlineKeyboard()
           : defaultInlineKeyboard();
 
@@ -1475,6 +1477,21 @@ function providersSummary(bot) {
   ].join("\n");
 }
 
+function fallbackSelectionChain(bot, currentId = "") {
+  const profiles = configuredProviderProfiles(bot);
+  const preferred = ["anthropic", "openrouter", "openai", "cohere", "ollama"];
+  const ordered = [];
+  for (const provider of preferred) {
+    ordered.push(...profiles.filter((profile) => profile.provider === provider && profile.id !== currentId));
+  }
+  for (const profile of profiles) {
+    if (profile.id !== currentId && !ordered.some((entry) => entry.id === profile.id)) {
+      ordered.push(profile);
+    }
+  }
+  return ordered;
+}
+
 async function listModels(bot, rawSelector = "") {
   const overrideProfile = rawSelector ? findProfile(bot, rawSelector) : null;
   const { selection, models } = await listProviderModels(bot, overrideProfile ? { profileId: overrideProfile.id } : {});
@@ -1495,8 +1512,24 @@ async function askModel(bot, prompt, systemOverride, overrideSelection) {
   if (!prompt) {
     throw new Error("Prompt is required.");
   }
-  const result = await generateText(bot, prompt, systemOverride, overrideSelection || {});
-  return String(result.text || "").trim();
+  try {
+    const result = await generateText(bot, prompt, systemOverride, overrideSelection || {});
+    return String(result.text || "").trim();
+  } catch (error) {
+    if (overrideSelection && overrideSelection.strict) {
+      throw error;
+    }
+    const current = currentSelection(bot, overrideSelection || {});
+    for (const profile of fallbackSelectionChain(bot, current.id)) {
+      try {
+        const fallback = await generateText(bot, prompt, systemOverride, {
+          profileId: profile.id
+        });
+        return String(fallback.text || "").trim();
+      } catch {}
+    }
+    throw error;
+  }
 }
 
 function currentChatMode(state) {
@@ -1583,6 +1616,78 @@ async function zipPathCommand(args, roots) {
 function defaultDesktopTaskDir(roots, label = "agent-task") {
   const desktopRoot = roots.find((root) => root.toLowerCase().endsWith(`${path.sep}desktop`)) || roots[0];
   return path.join(desktopRoot, "ZEN Agent Jobs", `${slugify(label)}-${timestampLabel()}`);
+}
+
+function defaultDesktopDocPath(roots, label = "document") {
+  const desktopRoot = roots.find((root) => root.toLowerCase().endsWith(`${path.sep}desktop`)) || roots[0];
+  return path.join(desktopRoot, "ZEN Docs", `${slugify(label)}-${timestampLabel()}.md`);
+}
+
+async function createDocumentCommand(args, roots) {
+  const [rawTitle, ...rest] = String(args || "").split("|");
+  const title = String(rawTitle || "").trim();
+  const content = rest.join("|").trim();
+  if (!title) {
+    throw new Error("Use /newdoc title | optional content");
+  }
+  const target = defaultDesktopDocPath(roots, title);
+  await fsp.mkdir(path.dirname(target), { recursive: true });
+  const body = content
+    ? `# ${title}\n\n${content}\n`
+    : `# ${title}\n\nCreated from Telegram on ${new Date().toLocaleString()}.\n`;
+  await fsp.writeFile(target, body, "utf8");
+  return `Created document\n${target}`;
+}
+
+async function listRecentDocuments(roots, rawPath = "") {
+  if (String(rawPath || "").trim()) {
+    return listFiles(rawPath, roots);
+  }
+  const candidates = [
+    roots.find((root) => root.toLowerCase().endsWith(`${path.sep}desktop`)) ? path.join(roots.find((root) => root.toLowerCase().endsWith(`${path.sep}desktop`)), "ZEN Docs") : "",
+    roots.find((root) => root.toLowerCase().endsWith(`${path.sep}desktop`)) ? path.join(roots.find((root) => root.toLowerCase().endsWith(`${path.sep}desktop`)), "ZEN Intake") : "",
+    roots.find((root) => root.toLowerCase().endsWith(`${path.sep}desktop`)) ? path.join(roots.find((root) => root.toLowerCase().endsWith(`${path.sep}desktop`)), "ZEN Agent Jobs") : ""
+  ].filter(Boolean);
+
+  const items = [];
+  for (const folder of candidates) {
+    if (!fs.existsSync(folder)) {
+      continue;
+    }
+    const entries = await fsp.readdir(folder, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(folder, entry.name);
+      const stats = await fsp.stat(fullPath);
+      items.push({
+        fullPath,
+        name: entry.name,
+        isDirectory: entry.isDirectory(),
+        modifiedAt: stats.mtime.getTime()
+      });
+    }
+  }
+
+  if (!items.length) {
+    return "No recent documents yet.\n\nUse /newdoc title | content or /intake name | objective";
+  }
+
+  const sorted = items.sort((a, b) => b.modifiedAt - a.modifiedAt).slice(0, 20);
+  return [
+    "Recent documents and work folders",
+    "",
+    ...sorted.map((item) => `${item.isDirectory ? "[DIR]" : "[FILE]"} ${item.fullPath}`)
+  ].join("\n");
+}
+
+async function workOnDocumentCommand(bot, token, chatId, roots, args) {
+  const [rawPath, ...rest] = String(args || "").split("|");
+  const targetPath = String(rawPath || "").trim();
+  const objective = rest.join("|").trim();
+  if (!targetPath) {
+    throw new Error("Use /workon path | objective");
+  }
+  const resolved = resolveAllowedPath(targetPath, roots);
+  return startAutopilotTask(bot, token, chatId, "doc", resolved, objective || "Read this document, improve it, and build a strong work pack.");
 }
 
 async function extractSpreadsheetText(filePath) {
@@ -1730,6 +1835,7 @@ function capabilitySummaryText(bot) {
     "",
     `Default supervisor: ollama:local | ${bot.ollamaModel || "qwen2.5-coder:7b"}`,
     `Current active AI: ${current.id} | ${current.model || "auto"}`,
+    "Remote resiliency: if the local model path fails, the bot can fall back to configured cloud providers for the conversational supervisor flow.",
     `Providers: ${providerLine}`,
     "Best task commands: /docagent, /sheetagent, /siteagent, /supervisor, /delegate, /autopilot, /squad",
     "Useful controls: /providers, /models, /modeluse, /tasks, /taskstatus, /scheduleadd",
@@ -2169,7 +2275,8 @@ async function runSingleProviderPass(bot, task, context, profile, outputDir) {
   const model = await resolveProfileModel(bot, profile);
   const override = {
     profileId: profile.id,
-    model
+    model,
+    strict: true
   };
   const analysis = await generateArtifact(
     bot,
@@ -2523,6 +2630,10 @@ function helpText(bot) {
     "/project - summarize the current workspace",
     "/fileinfo path - show file details",
     "/read path - read a text file",
+    "/viewdoc path - preview a document file",
+    "/newdoc title | optional content - create a markdown document on Desktop",
+    "/docs [path] - list recent documents and work folders",
+    "/workon path | objective - send a document into autopilot",
     "/write path | content - write a file",
     "/append path | content - append to a file",
     "/mkdir path - create a directory",
@@ -2611,6 +2722,9 @@ function telegramCommandList() {
     { command: "status", description: "Show bot and workspace status" },
     { command: "health", description: "Check runner, Wi-Fi, internet, and Ollama" },
     { command: "files", description: "List files in a folder" },
+    { command: "docs", description: "List recent documents and work folders" },
+    { command: "newdoc", description: "Create a markdown document on Desktop" },
+    { command: "workon", description: "Send a document into autopilot" },
     { command: "tree", description: "Show a file tree" },
     { command: "project", description: "Summarize the current project" },
     { command: "fileinfo", description: "Show file details" },
@@ -2893,6 +3007,7 @@ function buildPlannerPrompt(bot, roots, state, userText) {
     "- Prefer a normal reply when the user is chatting casually.",
     "- You know the slash commands, models, providers, and task workflows available in this bot. If the user asks how to do something, suggest the most relevant command or agent path.",
     "- qwen2.5-coder on local Ollama is the default supervisor model unless the user explicitly wants another provider or model.",
+    "- For document workflows, remember the simpler commands: /newdoc, /docs, /viewdoc, /workon, /autopilot, /squad.",
     "- Only use file tools for paths inside allowed roots.",
     ...modeRules,
     "- If the request is unsafe or unclear, reply instead of taking actions.",
@@ -3159,6 +3274,9 @@ async function executeTelegramCommand(bot, token, command, args, roots, chatId) 
   if (command === "files") {
     return { text: await listFiles(args, roots), extra: replyMarkupForCommand(command) };
   }
+  if (command === "docs") {
+    return { text: await listRecentDocuments(roots, args), extra: replyMarkupForCommand(command) };
+  }
   if (command === "tree") {
     return { text: await treeFiles(args, roots), extra: replyMarkupForCommand(command) };
   }
@@ -3174,8 +3292,17 @@ async function executeTelegramCommand(bot, token, command, args, roots, chatId) 
   if (command === "read") {
     return { text: await readFileCommand(args, roots), extra: replyMarkupForCommand(command) };
   }
+  if (command === "viewdoc") {
+    return { text: await readFileCommand(args, roots), extra: replyMarkupForCommand(command) };
+  }
   if (command === "fileinfo") {
     return { text: await fileInfoCommand(args, roots), extra: replyMarkupForCommand(command) };
+  }
+  if (command === "newdoc") {
+    return { text: await createDocumentCommand(args, roots), extra: replyMarkupForCommand(command) };
+  }
+  if (command === "workon") {
+    return { text: await workOnDocumentCommand(bot, token, chatId, roots, args), extra: replyMarkupForCommand("tasks") };
   }
   if (command === "write") {
     return { text: await writeFileCommand(args, roots, false), extra: replyMarkupForCommand(command) };
