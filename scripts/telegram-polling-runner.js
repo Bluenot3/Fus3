@@ -157,16 +157,10 @@ async function sendTelegramDocument(token, chatId, filePath, caption = "") {
 function commandKeyboard() {
   return {
     keyboard: [
-      [{ text: "/menu" }, { text: "/status" }, { text: "/health" }],
-      [{ text: "/files" }, { text: "/project" }, { text: "/wix" }],
+      [{ text: "/menu" }, { text: "/status" }, { text: "/capabilities" }],
       [{ text: "/docs" }, { text: "/newdoc" }, { text: "/workon" }],
-      [{ text: "/notionstatus" }, { text: "/notionsearch" }, { text: "/manuslist" }],
-      [{ text: "/workbench" }, { text: "/mode build" }, { text: "/devices" }],
-      [{ text: "/intake" }, { text: "/capturedone" }, { text: "/files desktop" }],
-      [{ text: "/network" }, { text: "/wifi" }, { text: "/gitstatus" }],
-      [{ text: "/providers" }, { text: "/models" }, { text: "/tasks" }],
-      [{ text: "/autopilot" }, { text: "/squad" }, { text: "/capabilities" }],
-      [{ text: "/schedules" }, { text: "/schedulehelp" }, { text: "/clear" }]
+      [{ text: "/autopilot" }, { text: "/squad" }, { text: "/tasks" }],
+      [{ text: "/providers" }, { text: "/models" }, { text: "/clear" }]
     ],
     resize_keyboard: true,
     is_persistent: true
@@ -311,8 +305,14 @@ function dashboardText(bot) {
   return [
     `${bot.name} control center`,
     "",
-    "Use the sections below for network, files, integrations, AI providers, tasks, and scheduling.",
-    "Natural language still works, but the button layout makes the high-value actions much faster."
+    `Default supervisor: local qwen2.5-coder (${bot.ollamaModel || "qwen2.5-coder:7b"})`,
+    "Quickest phone flows:",
+    "- /newdoc to create a document",
+    "- /workon to hand a document to the agent",
+    "- /autopilot to let the bot choose the best provider",
+    "- /squad to run a multi-model synthesis",
+    "",
+    "Use the panels below for documents, AI control, integrations, and scheduled work."
   ].join("\n");
 }
 

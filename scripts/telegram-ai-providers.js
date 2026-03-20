@@ -2,6 +2,19 @@ function ollamaBaseUrl(bot) {
   return String(bot.ollamaBaseUrl || process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434").replace(/\/+$/, "");
 }
 
+async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  try {
+    return await fetch(url, {
+      ...options,
+      signal: controller.signal
+    });
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function configuredProfiles(bot) {
   const profiles = [
     {
@@ -166,7 +179,7 @@ function currentSelection(bot, override = {}) {
 async function listModels(bot, override = {}) {
   const selection = currentSelection(bot, override);
   if (selection.provider === "ollama") {
-    const response = await fetch(`${selection.baseUrl}/api/tags`);
+    const response = await fetchWithTimeout(`${selection.baseUrl}/api/tags`, {}, 8000);
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
       throw new Error(payload.error || "Could not reach Ollama.");
@@ -179,12 +192,12 @@ async function listModels(bot, override = {}) {
   }
 
   if (selection.provider === "openai") {
-    const response = await fetch("https://api.openai.com/v1/models", {
+    const response = await fetchWithTimeout("https://api.openai.com/v1/models", {
       method: "GET",
       headers: {
         Authorization: `Bearer ${selection.apiKey}`
       }
-    });
+    }, 15000);
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
       throw new Error(payload.error?.message || payload.message || `OpenAI model listing failed (${response.status})`);
@@ -197,13 +210,13 @@ async function listModels(bot, override = {}) {
   }
 
   if (selection.provider === "cohere") {
-    const response = await fetch("https://api.cohere.ai/v1/models?endpoint=chat&page_size=100", {
+    const response = await fetchWithTimeout("https://api.cohere.ai/v1/models?endpoint=chat&page_size=100", {
       method: "GET",
       headers: {
         Authorization: `Bearer ${selection.apiKey}`,
         accept: "application/json"
       }
-    });
+    }, 15000);
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
       throw new Error(payload.message || payload.error || `Cohere model listing failed (${response.status})`);
@@ -217,13 +230,13 @@ async function listModels(bot, override = {}) {
   }
 
   if (selection.provider === "anthropic") {
-    const response = await fetch("https://api.anthropic.com/v1/models", {
+    const response = await fetchWithTimeout("https://api.anthropic.com/v1/models", {
       method: "GET",
       headers: {
         "x-api-key": selection.apiKey,
         "anthropic-version": "2023-06-01"
       }
-    });
+    }, 15000);
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
       throw new Error(payload.error?.message || payload.message || `Anthropic model listing failed (${response.status})`);
@@ -236,13 +249,13 @@ async function listModels(bot, override = {}) {
   }
 
   if (selection.provider === "openrouter") {
-    const response = await fetch("https://openrouter.ai/api/v1/models", {
+    const response = await fetchWithTimeout("https://openrouter.ai/api/v1/models", {
       method: "GET",
       headers: {
         Authorization: `Bearer ${selection.apiKey}`,
         accept: "application/json"
       }
-    });
+    }, 15000);
     const payload = await response.json().catch(() => ({}));
     if (!response.ok) {
       throw new Error(payload.error?.message || payload.message || `OpenRouter model listing failed (${response.status})`);
@@ -296,7 +309,7 @@ async function generateText(bot, prompt, systemPrompt, override = {}) {
   }
 
   if (selection.provider === "ollama") {
-    const response = await fetch(`${selection.baseUrl}/api/generate`, {
+    const response = await fetchWithTimeout(`${selection.baseUrl}/api/generate`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
@@ -305,7 +318,7 @@ async function generateText(bot, prompt, systemPrompt, override = {}) {
         prompt,
         stream: false
       })
-    });
+    }, 20000);
 
     const payload = await response.json().catch(() => ({}));
     if (!response.ok || !payload.response) {
@@ -331,7 +344,7 @@ async function generateText(bot, prompt, systemPrompt, override = {}) {
       content: [{ type: "input_text", text: prompt }]
     });
 
-    const response = await fetch("https://api.openai.com/v1/responses", {
+    const response = await fetchWithTimeout("https://api.openai.com/v1/responses", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${selection.apiKey}`,
@@ -342,7 +355,7 @@ async function generateText(bot, prompt, systemPrompt, override = {}) {
         input,
         max_output_tokens: 1800
       })
-    });
+    }, 30000);
 
     const payload = await response.json().catch(() => ({}));
     const text = extractOpenAiText(payload);
@@ -369,7 +382,7 @@ async function generateText(bot, prompt, systemPrompt, override = {}) {
       content: prompt
     });
 
-    const response = await fetch("https://api.cohere.ai/v2/chat", {
+    const response = await fetchWithTimeout("https://api.cohere.ai/v2/chat", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${selection.apiKey}`,
@@ -381,7 +394,7 @@ async function generateText(bot, prompt, systemPrompt, override = {}) {
         messages,
         max_tokens: 1400
       })
-    });
+    }, 30000);
 
     const payload = await response.json().catch(() => ({}));
     const text = payload?.message?.content?.[0]?.text || "";
@@ -396,7 +409,7 @@ async function generateText(bot, prompt, systemPrompt, override = {}) {
   }
 
   if (selection.provider === "anthropic") {
-    const response = await fetch("https://api.anthropic.com/v1/messages", {
+    const response = await fetchWithTimeout("https://api.anthropic.com/v1/messages", {
       method: "POST",
       headers: {
         "x-api-key": selection.apiKey,
@@ -414,7 +427,7 @@ async function generateText(bot, prompt, systemPrompt, override = {}) {
           }
         ]
       })
-    });
+    }, 30000);
 
     const payload = await response.json().catch(() => ({}));
     const text = (Array.isArray(payload.content) ? payload.content : [])
@@ -445,7 +458,7 @@ async function generateText(bot, prompt, systemPrompt, override = {}) {
       content: prompt
     });
 
-    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+    const response = await fetchWithTimeout("https://openrouter.ai/api/v1/chat/completions", {
       method: "POST",
       headers: {
         Authorization: `Bearer ${selection.apiKey}`,
@@ -457,7 +470,7 @@ async function generateText(bot, prompt, systemPrompt, override = {}) {
         messages,
         max_tokens: 1600
       })
-    });
+    }, 30000);
 
     const payload = await response.json().catch(() => ({}));
     const text = payload?.choices?.[0]?.message?.content || "";

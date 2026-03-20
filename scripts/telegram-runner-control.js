@@ -95,6 +95,8 @@ async function start(bot) {
   }
 
   const logs = logPaths(bot);
+  await fsp.writeFile(logs.out, "", "utf8");
+  await fsp.writeFile(logs.err, "", "utf8");
   const outFd = fs.openSync(logs.out, "a");
   const errFd = fs.openSync(logs.err, "a");
   const child = spawn(process.execPath, ["scripts/telegram-polling-runner.js", "--bot", bot], {
