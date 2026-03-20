@@ -248,7 +248,8 @@ function aiInlineKeyboard() {
   return inlineKeyboard([
     [{ text: "Providers", data: "cmd:providers" }, { text: "Models", data: "cmd:models" }],
     [{ text: "Use Ollama", data: "cmd:provider ollama" }, { text: "Use Cohere", data: "cmd:provider cohere" }],
-    [{ text: "Use OpenAI 1", data: "cmd:provider openai:project1" }, { text: "Use OpenAI 2", data: "cmd:provider openai:project2" }],
+    [{ text: "Use Claude", data: "cmd:provider anthropic" }, { text: "Use OpenRouter", data: "cmd:provider openrouter" }],
+    [{ text: "Use OpenAI 1", data: "cmd:provider openai:project1" }, { text: "Reset Qwen", data: "cmd:modeluse ollama | qwen2.5-coder:7b" }],
     [{ text: "Tasks", data: "nav:tasks" }, { text: "Home", data: "nav:dashboard" }]
   ]);
 }
@@ -257,6 +258,7 @@ function tasksInlineKeyboard() {
   return inlineKeyboard([
     [{ text: "Task List", data: "cmd:tasks" }, { text: "Task Help", data: "cmd:agenthelp" }],
     [{ text: "Doc Agent", data: "cmd:docagent desktop\\ZEN Intake\\sample.txt | build a detailed working plan" }],
+    [{ text: "Claude Doc", data: "cmd:delegate anthropic | doc | desktop\\ZEN Intake\\sample.txt | build a nuanced structured brief" }],
     [{ text: "Sheet Agent", data: "cmd:sheetagent desktop\\sample.xlsx | summarize this sheet and produce actions" }],
     [{ text: "Site Agent", data: "cmd:siteagent wix | audit the site and suggest upgrades" }],
     [{ text: "Home", data: "nav:dashboard" }]
@@ -364,7 +366,7 @@ function replyMarkupForCommand(command, forceInline = false) {
   const inline =
     command === "menu" || command === "dashboard"
       ? dashboardInlineKeyboard()
-      : command === "workbench" || command === "mode" || command === "ideas" || command === "planbuild" || command === "html" || command === "component" || command === "route" || command === "spec" || command === "replace" || command === "zip" || command === "docagent" || command === "sheetagent" || command === "siteagent" || command === "agenttask"
+      : command === "workbench" || command === "mode" || command === "ideas" || command === "planbuild" || command === "html" || command === "component" || command === "route" || command === "spec" || command === "replace" || command === "zip" || command === "docagent" || command === "sheetagent" || command === "siteagent" || command === "agenttask" || command === "supervisor" || command === "delegate"
         ? buildInlineKeyboard()
       : command === "providers" || command === "provider" || command === "models" || command === "model" || command === "modeluse"
         ? aiInlineKeyboard()
@@ -1463,6 +1465,7 @@ function providersSummary(bot) {
       return `${marker} ${profile.label} (${profile.id})`;
     }),
     "",
+    "Default supervisor brain: Ollama qwen2.5-coder stays the local default unless you switch or delegate.",
     `Active: ${current.label}`,
     `Model: ${current.model || "auto-select cheapest useful model"}`
   ].join("\n");
@@ -1717,6 +1720,47 @@ async function createAgentTaskRecord(bot, chatId, type, target, objective) {
     providerId: selection.id,
     providerLabel: selection.label,
     model: modelName,
+    status: "queued",
+    createdAt: nowIso(),
+    updatedAt: nowIso(),
+    startedAt: null,
+    completedAt: null,
+    outputDir: "",
+    outputs: [],
+    summary: "",
+    error: ""
+  };
+  const tasks = await readAgentTasks();
+  tasks.push(task);
+  await writeAgentTasks(tasks);
+  return task;
+}
+
+async function createAgentTaskRecordWithSelection(bot, chatId, type, target, objective, profileToken, modelName) {
+  const profile = findProfile(bot, profileToken);
+  if (!profile) {
+    throw new Error(`Unknown provider profile "${profileToken}"`);
+  }
+  let nextModel = String(modelName || "").trim();
+  if (!nextModel) {
+    try {
+      const listed = await listProviderModels(bot, { profileId: profile.id });
+      nextModel = pickCheapestUsefulModel(profile.provider, listed.models) || profile.defaultModel || "";
+    } catch {
+      nextModel = profile.defaultModel || "";
+    }
+  }
+  const task = {
+    id: makeId("task"),
+    shortId: makeId("job").split("-")[1],
+    botId: bot.id,
+    chatId: String(chatId),
+    type,
+    target: String(target || "").trim(),
+    objective: String(objective || "").trim() || "Create a practical work pack and actionable next steps.",
+    providerId: profile.id,
+    providerLabel: profile.label,
+    model: nextModel,
     status: "queued",
     createdAt: nowIso(),
     updatedAt: nowIso(),
@@ -2102,6 +2146,19 @@ async function startAgentTask(bot, token, chatId, type, target, objective) {
   ].join("\n");
 }
 
+async function startDelegatedTask(bot, token, chatId, providerToken, type, target, objective, modelName = "") {
+  const task = await createAgentTaskRecordWithSelection(bot, chatId, type, target, objective, providerToken, modelName);
+  runAgentTaskInBackground(bot, token, task.id).catch(() => {});
+  return [
+    `Queued delegated ${type} task.`,
+    `ID: ${task.shortId}`,
+    `Target: ${task.target || "prompt only"}`,
+    `AI: ${task.providerLabel} | ${task.model || "auto"}`,
+    "",
+    "I will supervise the task and report back here when it finishes."
+  ].join("\n");
+}
+
 function parseAgentTaskArgs(args, expectedType = "") {
   const parts = String(args || "").split("|").map((value) => value.trim());
   if (expectedType) {
@@ -2123,6 +2180,23 @@ function parseAgentTaskArgs(args, expectedType = "") {
     throw new Error("Supported agent types: doc, sheet, site, general");
   }
   return { type: normalizedType, target, objective };
+}
+
+function parseDelegateArgs(args) {
+  const [rawProvider, rawType, rawTarget, ...rest] = String(args || "").split("|").map((value) => value.trim());
+  if (!rawProvider || !rawType || !rawTarget) {
+    throw new Error("Use /delegate provider | doc|sheet|site|general | target | objective");
+  }
+  const type = rawType.toLowerCase();
+  if (!["doc", "sheet", "site", "general"].includes(type)) {
+    throw new Error("Supported delegate task types: doc, sheet, site, general");
+  }
+  return {
+    providerToken: rawProvider,
+    type,
+    target: rawTarget,
+    objective: rest.join(" | ").trim()
+  };
 }
 
 async function listAgentTasks(bot, chatId) {
@@ -2171,6 +2245,8 @@ function agentHelpText() {
     "",
     "/providers",
     "/provider openai:project1",
+    "/provider anthropic",
+    "/provider openrouter",
     "/models",
     "/model gpt-5-mini",
     "/modeluse cohere | command-r7b-12-2024",
@@ -2178,6 +2254,8 @@ function agentHelpText() {
     "/sheetagent desktop\\sheet.xlsx | summarize this data and produce actions",
     "/siteagent wix | audit the site and build a roadmap",
     "/agenttask general | desktop\\notes.txt | turn this into an execution pack",
+    "/supervisor doc | desktop\\file.txt | run a managed work pack",
+    "/delegate anthropic | doc | desktop\\file.txt | use Claude on this",
     "/tasks",
     "/taskstatus id",
     "/tasksend id"
@@ -2283,6 +2361,8 @@ function helpText(bot) {
     "/sheetagent path | objective - run a spreadsheet agent in the background",
     "/siteagent wix|url|path | objective - run a site/app agent in the background",
     "/agenttask type | target | objective - queue a general background task",
+    "/supervisor type | target | objective - queue a managed work pack on the current AI selection",
+    "/delegate provider | type | target | objective - send a task to a specific provider",
     "/tasks - list agent tasks for this chat",
     "/taskstatus id - inspect one agent task",
     "/tasksend id - resend the main task output files",
@@ -2323,10 +2403,14 @@ function telegramCommandList() {
     { command: "manus", description: "Start a low-cost Manus task" },
     { command: "manuslist", description: "List recent Manus tasks" },
     { command: "providers", description: "List configured AI providers" },
+    { command: "provider", description: "Switch the active AI provider" },
     { command: "models", description: "List models for the active provider" },
+    { command: "modeluse", description: "Switch provider and model together" },
     { command: "docagent", description: "Queue a background document agent" },
     { command: "sheetagent", description: "Queue a background spreadsheet agent" },
     { command: "siteagent", description: "Queue a background site agent" },
+    { command: "supervisor", description: "Queue a managed work pack" },
+    { command: "delegate", description: "Send work to a specific AI provider" },
     { command: "tasks", description: "List background agent tasks" },
     { command: "schedulehelp", description: "Show schedule examples" },
     { command: "schedules", description: "List saved schedules" },
@@ -2577,6 +2661,8 @@ function buildPlannerPrompt(bot, roots, state, userText) {
     "- Return only valid JSON.",
     "- Use at most 3 tool actions.",
     "- Prefer a normal reply when the user is chatting casually.",
+    "- You know the slash commands, models, providers, and task workflows available in this bot. If the user asks how to do something, suggest the most relevant command or agent path.",
+    "- qwen2.5-coder on local Ollama is the default supervisor model unless the user explicitly wants another provider or model.",
     "- Only use file tools for paths inside allowed roots.",
     ...modeRules,
     "- If the request is unsafe or unclear, reply instead of taking actions.",
@@ -3064,7 +3150,7 @@ async function executeTelegramCommand(bot, token, command, args, roots, chatId) 
   if (command === "provider") {
     const profile = findProfile(bot, args);
     if (!profile) {
-      throw new Error("Use /provider ollama, /provider cohere, /provider openai:project1, or /provider openai:project2");
+      throw new Error("Use /provider ollama, /provider cohere, /provider anthropic, /provider openrouter, or /provider openai:project1");
     }
     const listed = await listProviderModels(bot, { profileId: profile.id });
     const modelName = pickCheapestUsefulModel(profile.provider, listed.models);
@@ -3122,6 +3208,17 @@ async function executeTelegramCommand(bot, token, command, args, roots, chatId) 
   if (command === "agenttask") {
     const parsed = parseAgentTaskArgs(args);
     return { text: await startAgentTask(bot, token, chatId, parsed.type, parsed.target, parsed.objective), extra: replyMarkupForCommand("tasks") };
+  }
+  if (command === "supervisor") {
+    const parsed = parseAgentTaskArgs(args);
+    return { text: await startAgentTask(bot, token, chatId, parsed.type, parsed.target, parsed.objective), extra: replyMarkupForCommand("tasks") };
+  }
+  if (command === "delegate") {
+    const parsed = parseDelegateArgs(args);
+    return {
+      text: await startDelegatedTask(bot, token, chatId, parsed.providerToken, parsed.type, parsed.target, parsed.objective),
+      extra: replyMarkupForCommand("tasks")
+    };
   }
   if (command === "tasks") {
     return { text: await listAgentTasks(bot, chatId), extra: replyMarkupForCommand(command) };

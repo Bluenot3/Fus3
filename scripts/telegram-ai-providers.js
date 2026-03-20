@@ -49,7 +49,28 @@ function configuredProfiles(bot) {
     }
   ];
 
-  for (const profile of [...openAiProfiles, ...cohereProfiles]) {
+  const anthropicProfiles = [
+    {
+      id: "anthropic:default",
+      provider: "anthropic",
+      profile: "default",
+      label: "Anthropic Default",
+      apiKey: process.env.ANTHROPIC_API_KEY || ""
+    }
+  ];
+
+  const openRouterProfiles = [
+    {
+      id: "openrouter:default",
+      provider: "openrouter",
+      profile: "default",
+      label: "OpenRouter Default",
+      apiKey: process.env.OPENROUTER_API_KEY || "",
+      defaultModel: process.env.OPENROUTER_DEFAULT_MODEL || "openrouter/auto"
+    }
+  ];
+
+  for (const profile of [...openAiProfiles, ...cohereProfiles, ...anthropicProfiles, ...openRouterProfiles]) {
     if (profile.apiKey) {
       profiles.push({
         ...profile,
@@ -71,6 +92,12 @@ function preferredModelNames(provider) {
   }
   if (provider === "cohere") {
     return ["command-r7b-12-2024", "command-r-plus-08-2024", "command-a-03-2025"];
+  }
+  if (provider === "anthropic") {
+    return ["claude-3-5-haiku-latest", "claude-3-7-sonnet-latest", "claude-sonnet-4-20250514"];
+  }
+  if (provider === "openrouter") {
+    return ["openrouter/auto", "anthropic/claude-3.5-haiku", "openai/gpt-4o-mini", "qwen/qwen-2.5-coder-32b-instruct"];
   }
   return [];
 }
@@ -107,6 +134,8 @@ function findProfile(bot, rawValue) {
     profiles.find((profile) => normalizeToken(profile.id) === token) ||
     profiles.find((profile) => token === "openai1" && profile.id === "openai:project1") ||
     profiles.find((profile) => token === "openai2" && profile.id === "openai:project2") ||
+    profiles.find((profile) => token === "claude" && profile.provider === "anthropic") ||
+    profiles.find((profile) => token === "openrouterauto" && profile.id === "openrouter:default") ||
     profiles.find((profile) => normalizeToken(profile.provider) === token) ||
     profiles.find((profile) => normalizeToken(`${profile.provider}${profile.profile}`) === token) ||
     profiles.find((profile) => normalizeToken(`${profile.provider}${profile.profile}`) === token.replace(/[^a-z0-9]/g, "")) ||
@@ -126,7 +155,7 @@ function currentSelection(bot, override = {}) {
   const model =
     override.model ||
     bot.modelName ||
-    (profile.provider === "ollama" ? bot.ollamaModel || profile.defaultModel : "");
+    (profile.provider === "ollama" ? bot.ollamaModel || profile.defaultModel : profile.defaultModel || "");
 
   return {
     ...profile,
@@ -182,6 +211,44 @@ async function listModels(bot, override = {}) {
     const models = (Array.isArray(payload.models) ? payload.models : [])
       .filter((model) => !model.is_deprecated)
       .map((model) => model.name)
+      .filter(Boolean)
+      .sort();
+    return { selection, models };
+  }
+
+  if (selection.provider === "anthropic") {
+    const response = await fetch("https://api.anthropic.com/v1/models", {
+      method: "GET",
+      headers: {
+        "x-api-key": selection.apiKey,
+        "anthropic-version": "2023-06-01"
+      }
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload.error?.message || payload.message || `Anthropic model listing failed (${response.status})`);
+    }
+    const models = (Array.isArray(payload.data) ? payload.data : [])
+      .map((model) => model.id)
+      .filter(Boolean)
+      .sort();
+    return { selection, models };
+  }
+
+  if (selection.provider === "openrouter") {
+    const response = await fetch("https://openrouter.ai/api/v1/models", {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${selection.apiKey}`,
+        accept: "application/json"
+      }
+    });
+    const payload = await response.json().catch(() => ({}));
+    if (!response.ok) {
+      throw new Error(payload.error?.message || payload.message || `OpenRouter model listing failed (${response.status})`);
+    }
+    const models = (Array.isArray(payload.data) ? payload.data : [])
+      .map((model) => model.id)
       .filter(Boolean)
       .sort();
     return { selection, models };
@@ -320,6 +387,82 @@ async function generateText(bot, prompt, systemPrompt, override = {}) {
     const text = payload?.message?.content?.[0]?.text || "";
     if (!response.ok || !text) {
       throw new Error(payload.message || payload.error || "Cohere request failed.");
+    }
+
+    return {
+      selection,
+      text: String(text).trim()
+    };
+  }
+
+  if (selection.provider === "anthropic") {
+    const response = await fetch("https://api.anthropic.com/v1/messages", {
+      method: "POST",
+      headers: {
+        "x-api-key": selection.apiKey,
+        "anthropic-version": "2023-06-01",
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({
+        model: selection.model,
+        max_tokens: 1600,
+        system: systemPrompt || bot.systemPrompt || "",
+        messages: [
+          {
+            role: "user",
+            content: prompt
+          }
+        ]
+      })
+    });
+
+    const payload = await response.json().catch(() => ({}));
+    const text = (Array.isArray(payload.content) ? payload.content : [])
+      .filter((item) => item.type === "text" && item.text)
+      .map((item) => item.text)
+      .join("\n")
+      .trim();
+    if (!response.ok || !text) {
+      throw new Error(payload.error?.message || payload.message || "Anthropic request failed.");
+    }
+
+    return {
+      selection,
+      text
+    };
+  }
+
+  if (selection.provider === "openrouter") {
+    const messages = [];
+    if (systemPrompt || bot.systemPrompt) {
+      messages.push({
+        role: "system",
+        content: systemPrompt || bot.systemPrompt || ""
+      });
+    }
+    messages.push({
+      role: "user",
+      content: prompt
+    });
+
+    const response = await fetch("https://openrouter.ai/api/v1/chat/completions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${selection.apiKey}`,
+        "Content-Type": "application/json",
+        accept: "application/json"
+      },
+      body: JSON.stringify({
+        model: selection.model,
+        messages,
+        max_tokens: 1600
+      })
+    });
+
+    const payload = await response.json().catch(() => ({}));
+    const text = payload?.choices?.[0]?.message?.content || "";
+    if (!response.ok || !text) {
+      throw new Error(payload.error?.message || payload.message || "OpenRouter request failed.");
     }
 
     return {
