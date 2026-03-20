@@ -511,6 +511,17 @@ function nowIso() {
   return new Date().toISOString();
 }
 
+async function appendRunnerLog(botId, message) {
+  try {
+    await fsp.mkdir(LOG_DIR, { recursive: true });
+    await fsp.writeFile(
+      path.join(LOG_DIR, `runner-${botId}.log`),
+      `${nowIso()} ${message}\n`,
+      { flag: "a" }
+    );
+  } catch {}
+}
+
 function splitCommand(text) {
   const trimmed = String(text || "").trim();
   const [head, ...rest] = trimmed.split(/\s+/);
@@ -640,6 +651,40 @@ function formatBytes(size) {
     index += 1;
   }
   return `${value.toFixed(value >= 100 || index === 0 ? 0 : 1)} ${units[index]}`;
+}
+
+function parseQuickIntent(text) {
+  const value = String(text || "").trim();
+  const lower = value.toLowerCase();
+  if (!value) {
+    return null;
+  }
+  if (/^(hi|hello|hey|yo)\b/.test(lower)) {
+    return { command: "menu", args: "" };
+  }
+  if (/^(help|menu|start)\b/.test(lower)) {
+    return { command: "menu", args: "" };
+  }
+  if (/^(status|health|capabilities)\b/.test(lower)) {
+    return { command: lower.split(/\s+/)[0], args: "" };
+  }
+  if (/^(docs|documents)\b/.test(lower)) {
+    return { command: "docs", args: "" };
+  }
+  if (/^(new\s+doc|new\s+dock|new\s+document|create\s+doc|create\s+document)\b/.test(lower)) {
+    const title = value.replace(/^(new\s+doc|new\s+dock|new\s+document|create\s+doc|create\s+document)\b[:\s-]*/i, "").trim();
+    return { command: "newdoc", args: title || "quick-note" };
+  }
+  if (/^(work\s+on|assign\s+doc|assign\s+document)\b/.test(lower)) {
+    const rest = value.replace(/^(work\s+on|assign\s+doc|assign\s+document)\b[:\s-]*/i, "").trim();
+    if (rest) {
+      return { command: "workon", args: rest };
+    }
+  }
+  if (/^(providers|models|tasks)\b/.test(lower)) {
+    return { command: lower.split(/\s+/)[0], args: "" };
+  }
+  return null;
 }
 
 function requireWixConfig() {
@@ -3760,15 +3805,26 @@ async function handleMessage(bot, token, message) {
         state = response.state;
       }
     } else {
-      state = pushChatMessage(state, "user", text);
-      reply = await handleNaturalLanguage(bot, text, roots, state);
-      extra = replyMarkupForCommand("menu");
+      const quickIntent = parseQuickIntent(text);
+      if (quickIntent) {
+        const response = await executeTelegramCommand(bot, token, quickIntent.command, quickIntent.args, roots, chatId);
+        reply = response.text;
+        extra = response.extra || {};
+        if (response.state) {
+          state = response.state;
+        }
+      } else {
+        state = pushChatMessage(state, "user", text);
+        reply = await handleNaturalLanguage(bot, text, roots, state);
+        extra = replyMarkupForCommand("menu");
+      }
     }
     await sendTelegramText(token, chatId, reply, extra);
 
     state = pushChatMessage(state, "assistant", reply);
     await writeChatState(bot.id, chatId, state);
   } catch (error) {
+    await appendRunnerLog(bot.id, `message error chat=${chatId} text=${JSON.stringify(text).slice(0, 400)} error=${error.stack || error.message || String(error)}`);
     await sendTelegramText(token, chatId, `Error: ${userFacingErrorMessage(error)}`);
   }
 }
