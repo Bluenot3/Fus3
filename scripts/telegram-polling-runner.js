@@ -124,6 +124,7 @@ function commandKeyboard() {
       [{ text: "/menu" }, { text: "/status" }, { text: "/health" }],
       [{ text: "/files" }, { text: "/project" }, { text: "/wix" }],
       [{ text: "/notionstatus" }, { text: "/notionsearch" }, { text: "/manuslist" }],
+      [{ text: "/workbench" }, { text: "/mode build" }, { text: "/devices" }],
       [{ text: "/network" }, { text: "/wifi" }, { text: "/gitstatus" }],
       [{ text: "/schedules" }, { text: "/schedulehelp" }],
       [{ text: "/models" }, { text: "/clear" }]
@@ -149,7 +150,8 @@ function homeInlineKeyboard() {
     [{ text: "Status", data: "cmd:status" }, { text: "Health", data: "cmd:health" }],
     [{ text: "Files", data: "cmd:files" }, { text: "Project", data: "cmd:project" }],
     [{ text: "Wix", data: "cmd:wix" }, { text: "Notion", data: "cmd:notionstatus" }],
-    [{ text: "Manus", data: "cmd:manuslist" }, { text: "Network", data: "cmd:network" }],
+    [{ text: "Workbench", data: "cmd:workbench" }, { text: "Manus", data: "cmd:manuslist" }],
+    [{ text: "Network", data: "cmd:network" }, { text: "Mode Build", data: "cmd:mode build" }],
     [{ text: "Schedules", data: "cmd:schedules" }, { text: "Models", data: "cmd:models" }],
     [{ text: "Clear Chat", data: "cmd:clear" }]
   ]);
@@ -166,7 +168,7 @@ function projectInlineKeyboard() {
   return inlineKeyboard([
     [{ text: "Files", data: "cmd:files" }, { text: "Git Status", data: "cmd:gitstatus" }],
     [{ text: "Git Log", data: "cmd:gitlog" }, { text: "Find package", data: "cmd:find package" }],
-    [{ text: "Tree", data: "cmd:tree" }, { text: "Schedules", data: "cmd:schedules" }],
+    [{ text: "Tree", data: "cmd:tree" }, { text: "Workbench", data: "nav:build" }],
     [{ text: "Home", data: "nav:home" }]
   ]);
 }
@@ -227,6 +229,9 @@ function navigationScreen(bot, key) {
   if (key === "files") {
     return { text: "Files panel", extra: { reply_markup: projectInlineKeyboard() } };
   }
+  if (key === "build") {
+    return { text: "Build panel", extra: { reply_markup: buildInlineKeyboard() } };
+  }
   if (key === "schedules") {
     return { text: "Schedules panel", extra: { reply_markup: scheduleInlineKeyboard() } };
   }
@@ -246,14 +251,16 @@ function dashboardInlineKeyboard() {
   return inlineKeyboard([
     [{ text: "Control", data: "nav:control" }, { text: "Network", data: "nav:network" }],
     [{ text: "Devices", data: "nav:devices" }, { text: "Integrations", data: "nav:integrations" }],
-    [{ text: "Files", data: "nav:files" }, { text: "Schedules", data: "nav:schedules" }]
+    [{ text: "Files", data: "nav:files" }, { text: "Build", data: "nav:build" }],
+    [{ text: "Schedules", data: "nav:schedules" }]
   ]);
 }
 
 function controlInlineKeyboard() {
   return inlineKeyboard([
     [{ text: "Status", data: "cmd:status" }, { text: "Health", data: "cmd:health" }],
-    [{ text: "Project", data: "cmd:project" }, { text: "Models", data: "cmd:models" }],
+    [{ text: "Project", data: "cmd:project" }, { text: "Workbench", data: "cmd:workbench" }],
+    [{ text: "Models", data: "cmd:models" }, { text: "Build Mode", data: "cmd:mode build" }],
     [{ text: "Home", data: "nav:dashboard" }]
   ]);
 }
@@ -274,10 +281,21 @@ function devicesInlineKeyboard() {
   ]);
 }
 
+function buildInlineKeyboard() {
+  return inlineKeyboard([
+    [{ text: "Workbench", data: "cmd:workbench" }, { text: "Mode Build", data: "cmd:mode build" }],
+    [{ text: "Ideas", data: "cmd:ideas app ideas for my repo" }, { text: "Plan", data: "cmd:planbuild build a new polished dashboard" }],
+    [{ text: "HTML", data: "cmd:html scratch\\prototype.html | build a polished landing page" }, { text: "Spec", data: "cmd:spec docs\\idea.md | outline a project spec" }],
+    [{ text: "Read Mode", data: "cmd:mode read" }, { text: "Home", data: "nav:dashboard" }]
+  ]);
+}
+
 function replyMarkupForCommand(command, forceInline = false) {
   const inline =
     command === "menu" || command === "dashboard"
       ? dashboardInlineKeyboard()
+      : command === "workbench" || command === "mode" || command === "ideas" || command === "planbuild" || command === "html" || command === "component" || command === "route" || command === "spec" || command === "replace" || command === "zip"
+        ? buildInlineKeyboard()
       : command === "wix" || command === "wixcontacts"
       ? wixInlineKeyboard()
       : command === "notionstatus" || command === "notionsearch" || command === "notionopen" || command === "notionpage" || command === "notionappend" || command === "notionappendto" || command === "notioncreate" || command === "notioncreatein" || command === "notionquery" || command === "notionusers"
@@ -1352,6 +1370,81 @@ async function askModel(bot, prompt, systemOverride) {
   return String(payload.response).trim();
 }
 
+function currentChatMode(state) {
+  return state && state.mode === "build" ? "build" : "read";
+}
+
+function withChatMode(state, mode) {
+  return {
+    ...(state || { messages: [] }),
+    mode: mode === "build" ? "build" : "read"
+  };
+}
+
+async function generateArtifact(bot, prompt, systemPrompt) {
+  const output = await askModel(bot, prompt, systemPrompt);
+  return String(output || "").replace(/^```[a-zA-Z]*\s*/g, "").replace(/```$/g, "").trim();
+}
+
+async function writeGeneratedArtifact(bot, roots, args, systemPrompt, promptLabel) {
+  const [rawPath, ...rest] = String(args || "").split("|");
+  const targetPath = String(rawPath || "").trim();
+  const prompt = rest.join("|").trim();
+  if (!targetPath || !prompt) {
+    throw new Error(`Use /${promptLabel} path | prompt`);
+  }
+
+  const content = await generateArtifact(bot, prompt, systemPrompt);
+  await writeFileCommand(`${targetPath} | ${content}`, roots, false);
+  return `Created ${targetPath}`;
+}
+
+async function replaceInFileCommand(args, roots) {
+  const [rawPath, rawOld, ...rest] = String(args || "").split("|");
+  const targetPath = String(rawPath || "").trim();
+  const oldText = String(rawOld || "");
+  const newText = rest.join("|");
+  if (!targetPath || !oldText) {
+    throw new Error("Use /replace path | old text | new text");
+  }
+  const target = resolveAllowedPath(targetPath, roots);
+  const source = await fsp.readFile(target, "utf8");
+  if (!source.includes(oldText)) {
+    throw new Error("The target text was not found in that file.");
+  }
+  await fsp.writeFile(target, source.replace(oldText, newText), "utf8");
+  return `Updated ${target}`;
+}
+
+async function zipPathCommand(args, roots) {
+  const rawPath = String(args || "").trim();
+  if (!rawPath) {
+    throw new Error("Use /zip path");
+  }
+  const target = resolveAllowedPath(rawPath, roots);
+  const zipTarget = `${target}.zip`;
+  await shellExec(`if (Test-Path '${zipTarget.replace(/'/g, "''")}') { Remove-Item '${zipTarget.replace(/'/g, "''")}' -Force }; Compress-Archive -Path '${target.replace(/'/g, "''")}' -DestinationPath '${zipTarget.replace(/'/g, "''")}' -Force`, roots[0]);
+  return `Created archive ${zipTarget}`;
+}
+
+async function ideasCommand(bot, prompt) {
+  const text = await askModel(
+    bot,
+    `Give me a concise but creative set of build ideas for this request:\n\n${prompt || "new product ideas"}`,
+    "You are a sharp product and creative engineering partner. Respond with a short list of bold, practical build ideas."
+  );
+  return truncateForTelegram(text);
+}
+
+async function planBuildCommand(bot, prompt) {
+  const text = await askModel(
+    bot,
+    `Create a strong implementation plan for this build request:\n\n${prompt || "new product feature"}`,
+    "You are a senior engineer. Return a concise implementation plan with architecture, files to touch, risks, and a recommended build sequence."
+  );
+  return truncateForTelegram(text);
+}
+
 function helpText(bot) {
   return [
     `Connected to ${bot.name}${bot.username ? ` (@${bot.username})` : ""}`,
@@ -1361,6 +1454,8 @@ function helpText(bot) {
     "/start - show this help",
     "/dashboard - open the grouped control dashboard",
     "/menu - show the quick action menu again",
+    "/workbench - open the build-focused tool panel",
+    "/mode read|build - switch natural-language behavior",
     "/status - show current laptop bot status",
     "/health - show connection and runner health",
     "/roots - list allowed roots",
@@ -1376,6 +1471,14 @@ function helpText(bot) {
     "/move source | target - move a file or folder",
     "/run command - run a PowerShell command in the primary root",
     "/ask prompt - send a prompt to Ollama",
+    "/ideas prompt - brainstorm things to build",
+    "/planbuild prompt - create a build plan",
+    "/html path | prompt - generate a polished HTML app",
+    "/component path | prompt - generate a React component",
+    "/route path | prompt - generate a Next.js route",
+    "/spec path | prompt - generate a markdown spec",
+    "/replace path | old | new - targeted file replacement",
+    "/zip path - archive a file or folder",
     "/find pattern | optional path - find files by name",
     "/grep text | optional path - search file contents",
     "/gitstatus - show repo status",
@@ -1422,6 +1525,8 @@ function telegramCommandList() {
   return [
     { command: "start", description: "Open the main help and controls" },
     { command: "dashboard", description: "Open the grouped control dashboard" },
+    { command: "workbench", description: "Open the build tool panel" },
+    { command: "mode", description: "Switch read/build behavior" },
     { command: "menu", description: "Show the quick action menu" },
     { command: "status", description: "Show bot and workspace status" },
     { command: "health", description: "Check runner, Wi-Fi, internet, and Ollama" },
@@ -1434,6 +1539,8 @@ function telegramCommandList() {
     { command: "devices", description: "List saved and scanned devices" },
     { command: "devicescan", description: "Quick scan the local subnet" },
     { command: "wifi", description: "Show current Wi-Fi details" },
+    { command: "ideas", description: "Brainstorm things to build" },
+    { command: "planbuild", description: "Create a build plan" },
     { command: "wix", description: "Show Wix site summary" },
     { command: "notionstatus", description: "Check Notion connection" },
     { command: "notionsearch", description: "Search accessible Notion content" },
@@ -1454,9 +1561,13 @@ async function readChatState(botId, chatId) {
   const target = chatStatePath(botId, chatId);
   try {
     const raw = await fsp.readFile(target, "utf8");
-    return JSON.parse(raw);
+    const parsed = JSON.parse(raw);
+    return {
+      messages: Array.isArray(parsed.messages) ? parsed.messages : [],
+      mode: parsed.mode === "build" ? "build" : "read"
+    };
   } catch {
-    return { messages: [] };
+    return { messages: [], mode: "read" };
   }
 }
 
@@ -1474,7 +1585,8 @@ async function clearChatState(botId, chatId) {
 function pushChatMessage(state, role, content) {
   const next = [...(state.messages || []), { role, content, at: new Date().toISOString() }];
   return {
-    messages: next.slice(-MAX_HISTORY_MESSAGES)
+    messages: next.slice(-MAX_HISTORY_MESSAGES),
+    mode: currentChatMode(state)
   };
 }
 
@@ -1487,7 +1599,7 @@ function extractJsonObject(text) {
   return JSON.parse(match[0]);
 }
 
-async function executeToolAction(bot, action, roots) {
+async function executeToolAction(bot, action, roots, state) {
   const tool = String(action.tool || "").toLowerCase();
 
   if (tool === "reply") {
@@ -1521,6 +1633,36 @@ async function executeToolAction(bot, action, roots) {
   }
   if (tool === "read_file") {
     return { tool, result: await readFileCommand(action.path || "", roots) };
+  }
+  if (tool === "write_file") {
+    if (currentChatMode(state) !== "build") {
+      throw new Error("write_file is only available in build mode.");
+    }
+    return { tool, result: await writeFileCommand(`${action.path || ""} | ${String(action.content || "")}`, roots, false) };
+  }
+  if (tool === "append_file") {
+    if (currentChatMode(state) !== "build") {
+      throw new Error("append_file is only available in build mode.");
+    }
+    return { tool, result: await writeFileCommand(`${action.path || ""} | ${String(action.content || "")}`, roots, true) };
+  }
+  if (tool === "make_dir") {
+    if (currentChatMode(state) !== "build") {
+      throw new Error("make_dir is only available in build mode.");
+    }
+    return { tool, result: await mkdirCommand(action.path || "", roots) };
+  }
+  if (tool === "replace_in_file") {
+    if (currentChatMode(state) !== "build") {
+      throw new Error("replace_in_file is only available in build mode.");
+    }
+    return { tool, result: await replaceInFileCommand(`${action.path || ""} | ${String(action.old_text || action.oldText || "")} | ${String(action.new_text || action.newText || "")}`, roots) };
+  }
+  if (tool === "run_command") {
+    if (currentChatMode(state) !== "build") {
+      throw new Error("run_command is only available in build mode.");
+    }
+    return { tool, result: await runCommand(String(action.command || ""), roots) };
   }
   if (tool === "file_info") {
     return { tool, result: await fileInfoCommand(action.path || "", roots) };
@@ -1588,10 +1730,31 @@ function buildPlannerPrompt(bot, roots, state, userText) {
     .slice(-6)
     .map((message) => `${message.role.toUpperCase()}: ${message.content}`)
     .join("\n");
+  const mode = currentChatMode(state);
+  const buildTools = mode === "build"
+    ? [
+        "- write_file with path and content",
+        "- append_file with path and content",
+        "- make_dir with path",
+        "- replace_in_file with path, old_text, new_text",
+        "- run_command with command"
+      ]
+    : [];
+  const modeRules = mode === "build"
+    ? [
+        "- Build mode is enabled. You may create files, folders, replacements, and safe commands when clearly useful.",
+        "- Prefer concrete implementation steps over generic advice when the user asks you to build something.",
+        "- Keep commands safe and inside the allowed roots."
+      ]
+    : [
+        "- This planner is read-only by default. Do not write files, create folders, or run arbitrary commands.",
+        "- For risky or state-changing requests, reply with guidance instead of taking action."
+      ];
 
   return [
     "You are a Telegram laptop assistant with access to local tools.",
     bot.systemPrompt || "",
+    `Current mode: ${mode}`,
     "",
     "Allowed roots:",
     ...roots.map((root) => `- ${root}`),
@@ -1624,14 +1787,14 @@ function buildPlannerPrompt(bot, roots, state, userText) {
     "- notion_page with page_id",
     "- fetch_url with url",
     "- ask_model with prompt",
+    ...buildTools,
     "",
     "Rules:",
     "- Return only valid JSON.",
     "- Use at most 3 tool actions.",
     "- Prefer a normal reply when the user is chatting casually.",
     "- Only use file tools for paths inside allowed roots.",
-    "- This planner is read-only by default. Do not write files, create folders, or run arbitrary commands.",
-    "- For risky or state-changing requests, reply with guidance instead of taking action.",
+    ...modeRules,
     "- If the request is unsafe or unclear, reply instead of taking actions.",
     "",
     "JSON schema:",
@@ -1686,7 +1849,7 @@ async function handleNaturalLanguage(bot, userText, roots, state) {
   const toolResults = [];
   for (const action of plan.actions.slice(0, MAX_TOOL_ACTIONS)) {
     try {
-      toolResults.push(await executeToolAction(bot, action, roots));
+      toolResults.push(await executeToolAction(bot, action, roots, state));
     } catch (error) {
       toolResults.push({
         tool: String(action.tool || "unknown"),
@@ -1837,13 +2000,24 @@ async function processSchedules(bot, token) {
 }
 
 async function executeTelegramCommand(bot, command, args, roots, chatId) {
-  let state = null;
+  let state = await readChatState(bot.id, chatId);
 
   if (command === "start" || command === "help") {
     return { text: helpText(bot), extra: { reply_markup: commandKeyboard() } };
   }
   if (command === "menu" || command === "dashboard") {
     return { text: dashboardText(bot), extra: { reply_markup: dashboardInlineKeyboard() } };
+  }
+  if (command === "workbench") {
+    return { text: `Build workbench\nCurrent mode: ${currentChatMode(state)}`, extra: { reply_markup: buildInlineKeyboard() } };
+  }
+  if (command === "mode") {
+    const nextMode = String(args || "").trim().toLowerCase();
+    if (nextMode !== "read" && nextMode !== "build") {
+      throw new Error("Use /mode read or /mode build");
+    }
+    state = withChatMode(state, nextMode);
+    return { text: `Mode changed to ${nextMode}.`, extra: replyMarkupForCommand("workbench"), state };
   }
   if (command === "status") {
     return {
@@ -1852,7 +2026,8 @@ async function executeTelegramCommand(bot, command, args, roots, chatId) {
         `Primary root: ${roots[0]}`,
         `Allowed roots: ${roots.length}`,
         `Ollama base: ${bot.ollamaBaseUrl || "not set"}`,
-        `Ollama model: ${bot.ollamaModel || "not set"}`
+        `Ollama model: ${bot.ollamaModel || "not set"}`,
+        `Mode: ${currentChatMode(state)}`
       ].join("\n"),
       extra: replyMarkupForCommand(command)
     };
@@ -1910,6 +2085,66 @@ async function executeTelegramCommand(bot, command, args, roots, chatId) {
   }
   if (command === "ask") {
     return { text: truncateForTelegram(await askModel(bot, args)), extra: replyMarkupForCommand(command) };
+  }
+  if (command === "ideas") {
+    return { text: await ideasCommand(bot, args), extra: replyMarkupForCommand("workbench") };
+  }
+  if (command === "planbuild") {
+    return { text: await planBuildCommand(bot, args), extra: replyMarkupForCommand("workbench") };
+  }
+  if (command === "html") {
+    return {
+      text: await writeGeneratedArtifact(
+        bot,
+        roots,
+        args,
+        "Return only a complete HTML document with inline CSS and JS. No markdown fences.",
+        "html"
+      ),
+      extra: replyMarkupForCommand("workbench")
+    };
+  }
+  if (command === "component") {
+    return {
+      text: await writeGeneratedArtifact(
+        bot,
+        roots,
+        args,
+        "Return only a React TSX component file. No markdown fences. Keep it production-ready.",
+        "component"
+      ),
+      extra: replyMarkupForCommand("workbench")
+    };
+  }
+  if (command === "route") {
+    return {
+      text: await writeGeneratedArtifact(
+        bot,
+        roots,
+        args,
+        "Return only a Next.js route handler in TypeScript. No markdown fences.",
+        "route"
+      ),
+      extra: replyMarkupForCommand("workbench")
+    };
+  }
+  if (command === "spec") {
+    return {
+      text: await writeGeneratedArtifact(
+        bot,
+        roots,
+        args,
+        "Return only markdown. Write a concise but strong project specification.",
+        "spec"
+      ),
+      extra: replyMarkupForCommand("workbench")
+    };
+  }
+  if (command === "replace") {
+    return { text: await replaceInFileCommand(args, roots), extra: replyMarkupForCommand("workbench") };
+  }
+  if (command === "zip") {
+    return { text: await zipPathCommand(args, roots), extra: replyMarkupForCommand("workbench") };
   }
   if (command === "gitstatus") {
     return { text: await gitStatus(roots), extra: replyMarkupForCommand(command) };
@@ -2026,7 +2261,7 @@ async function executeTelegramCommand(bot, command, args, roots, chatId) {
   }
   if (command === "clear") {
     await clearChatState(bot.id, chatId);
-    state = { messages: [] };
+    state = { messages: [], mode: currentChatMode(state) };
     return { text: "Chat memory cleared for this conversation.", extra: replyMarkupForCommand(command), state };
   }
 
