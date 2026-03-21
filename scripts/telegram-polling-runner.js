@@ -47,6 +47,8 @@ const SEARCH_RESULT_LIMIT = 25;
 const POLL_BACKOFF_MS = 8000;
 const SCHEDULER_TICK_MS = 15000;
 const TASK_SOURCE_MAX_CHARS = 28000;
+const UPDATE_DEDUPE_TTL_MS = 10 * 60 * 1000;
+const REPLY_DEDUPE_TTL_MS = 20 * 1000;
 const DANGEROUS_COMMAND_PATTERNS = [
   /\bremove-item\b/i,
   /\bdel\b/i,
@@ -68,6 +70,8 @@ const DANGEROUS_COMMAND_PATTERNS = [
   /\bgit\s+reset\s+--hard\b/i,
   /\bgit\s+clean\b/i
 ];
+const RECENT_UPDATE_KEYS = new Map();
+const RECENT_REPLY_KEYS = new Map();
 
 loadEnvFile(path.join(ROOT, ".env.local"));
 
@@ -121,15 +125,48 @@ async function telegram(token, method, body) {
   });
   const payload = await response.json();
   if (!response.ok || !payload.ok) {
-    throw new Error(payload.description || `Telegram ${method} failed`);
+    const error = new Error(payload.description || `Telegram ${method} failed`);
+    error.errorCode = payload.error_code || response.status;
+    error.retryAfter = Number(payload.parameters?.retry_after || 0);
+    throw error;
   }
   return payload.result;
 }
 
+function touchRecentKey(cache, key, ttlMs) {
+  const now = Date.now();
+  const previous = cache.get(key);
+  for (const [entryKey, timestamp] of cache.entries()) {
+    if (now - timestamp > ttlMs) {
+      cache.delete(entryKey);
+    }
+  }
+  cache.set(key, now);
+  return previous && now - previous < ttlMs;
+}
+
+function duplicateReplyKey(chatId, text) {
+  return `${chatId}:${String(text || "").trim().slice(0, 1200)}`;
+}
+
+function isRateLimitError(error) {
+  const message = String(error && (error.message || error) || "");
+  return Number(error && error.errorCode) === 429 || /too many requests|retry after/i.test(message);
+}
+
+function retryAfterMs(error, fallbackMs = 3000) {
+  const seconds = Number(error && error.retryAfter || 0);
+  return seconds > 0 ? seconds * 1000 : fallbackMs;
+}
+
 async function sendTelegramText(token, chatId, text, extra = {}) {
+  const normalized = truncateForTelegram(text);
+  if (touchRecentKey(RECENT_REPLY_KEYS, duplicateReplyKey(chatId, normalized), REPLY_DEDUPE_TTL_MS)) {
+    return { ok: true, suppressed: true };
+  }
   return telegram(token, "sendMessage", {
     chat_id: chatId,
-    text: truncateForTelegram(text),
+    text: normalized,
     ...extra
   });
 }
@@ -3885,7 +3922,11 @@ async function handleMessage(bot, token, message) {
     await writeChatState(bot.id, chatId, state);
   } catch (error) {
     await appendRunnerLog(bot.id, `message error chat=${chatId} text=${JSON.stringify(text).slice(0, 400)} error=${error.stack || error.message || String(error)}`);
-    await sendTelegramText(token, chatId, `Error: ${userFacingErrorMessage(error)}`);
+    if (!isRateLimitError(error)) {
+      await sendTelegramText(token, chatId, `Error: ${userFacingErrorMessage(error)}`).catch(() => {});
+    } else {
+      await appendRunnerLog(bot.id, `rate-limit suppress chat=${chatId} retryAfterMs=${retryAfterMs(error)}`);
+    }
   } finally {
     stopTyping();
   }
@@ -4001,6 +4042,15 @@ async function main() {
       for (const update of updates) {
         offset = Math.max(offset, Number(update.update_id) + 1);
         await fsp.writeFile(stateFile, JSON.stringify({ offset }, null, 2), "utf8");
+        const updateKey = update.message
+          ? `m:${update.message.chat?.id}:${update.message.message_id}`
+          : update.callback_query
+            ? `c:${update.callback_query.id}`
+            : `u:${update.update_id}`;
+        if (touchRecentKey(RECENT_UPDATE_KEYS, updateKey, UPDATE_DEDUPE_TTL_MS)) {
+          await appendRunnerLog(bot.id, `duplicate update skipped ${updateKey}`);
+          continue;
+        }
         if (update.message) {
           await handleMessage(bot, token, update.message);
         } else if (update.callback_query) {
@@ -4013,7 +4063,7 @@ async function main() {
         `${new Date().toISOString()} polling retry: ${error.message || String(error)}\n`,
         { flag: "a" }
       );
-      await new Promise((resolve) => setTimeout(resolve, POLL_BACKOFF_MS));
+      await new Promise((resolve) => setTimeout(resolve, isRateLimitError(error) ? retryAfterMs(error, POLL_BACKOFF_MS) : POLL_BACKOFF_MS));
     }
   }
 }
