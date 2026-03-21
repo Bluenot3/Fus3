@@ -3300,22 +3300,31 @@ function buildFinalResponsePrompt(bot, state, userText, toolResults) {
 
 async function handleDirectChat(bot, userText, state) {
   const history = (state.messages || [])
-    .slice(-6)
+    .slice(-3)
     .map((message) => `${message.role.toUpperCase()}: ${message.content}`)
     .join("\n");
   const profile = fastChatProfile(bot);
-  const prompt = [
-    history ? `Recent conversation:\n${history}\n` : "Recent conversation:\n(none)\n",
-    `User message:\n${userText}\n`,
-    "Reply naturally for Telegram.",
-    "Be concise, friendly, and useful.",
-    "If the user seems to want action, mention the most relevant command or task flow briefly."
-  ].join("\n");
+  const isShortGreeting = /^(hi|hello|hey|yo|sup|what's up|whats up)\b/i.test(String(userText || "").trim());
+  const prompt = isShortGreeting
+    ? [
+        `User message: ${userText}`,
+        "Reply naturally in 1 or 2 short sentences for Telegram.",
+        "You are the local qwen2.5-coder assistant running on this laptop.",
+        "Do not output a menu or command list unless the user asks."
+      ].join("\n")
+    : [
+        history ? `Recent conversation:\n${history}\n` : "Recent conversation:\n(none)\n",
+        `User message:\n${userText}\n`,
+        "Reply naturally for Telegram.",
+        "Be concise, friendly, and useful.",
+        "Answer questions about your tools, files, apps, laptop access, and connected providers clearly.",
+        "If the user seems to want action, mention the most relevant command or task flow briefly."
+      ].join("\n");
 
   const reply = await askModel(
     bot,
     prompt,
-    "You are a responsive Telegram assistant. Keep replies short, clear, and helpful.",
+    "You are a responsive Telegram assistant running locally on this laptop with qwen2.5-coder as the default brain. Keep replies short, clear, and helpful.",
     profile ? { profileId: profile.id } : undefined
   );
   return truncateForTelegram(reply);
@@ -4014,15 +4023,9 @@ async function handleMessage(bot, token, message) {
           state = response.state;
         }
       } else {
-        const quickReply = conversationalQuickReply(bot, text, roots, state);
         state = pushChatMessage(state, "user", text);
-        if (quickReply) {
-          reply = quickReply;
-          extra = replyMarkupForCommand("menu");
-        } else {
-          reply = await handleNaturalLanguage(bot, text, roots, state);
-          extra = replyMarkupForCommand("menu");
-        }
+        reply = await handleNaturalLanguage(bot, text, roots, state);
+        extra = replyMarkupForCommand("menu");
       }
     }
     await sendTelegramText(token, chatId, reply, extra);
