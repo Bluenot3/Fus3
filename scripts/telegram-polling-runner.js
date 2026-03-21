@@ -753,9 +753,6 @@ function parseQuickIntent(text) {
   if (!value) {
     return null;
   }
-  if (/^(hi|hello|hey|yo)\b/.test(lower)) {
-    return { command: "menu", args: "" };
-  }
   if (/^(help|menu|start)\b/.test(lower)) {
     return { command: "menu", args: "" };
   }
@@ -797,6 +794,59 @@ function parseQuickIntent(text) {
     return { command: lower.split(/\s+/)[0], args: "" };
   }
   return null;
+}
+
+function conversationalQuickReply(bot, text, roots, state) {
+  const value = String(text || "").trim();
+  const lower = value.toLowerCase();
+  if (!value) {
+    return "";
+  }
+
+  if (/^(hi|hello|hey|yo)\b/.test(lower)) {
+    return [
+      `Hi. I'm ${bot.displayName || bot.name}, running locally on this laptop.`,
+      `Default brain: qwen2.5-coder on Ollama (${bot.ollamaModel || "qwen2.5-coder:7b"}).`,
+      `I can chat naturally, work with files, inspect the repo, use Wix/Notion/Manus, and delegate to your other AI providers when needed.`,
+      `Try: "summarize my project", "create a draft note", or "/dashboard".`
+    ].join("\n");
+  }
+
+  if (/\b(what can you do|what do you do|abilities|capabilities|tools|commands|help me)\b/.test(lower)) {
+    return [
+      `I can help across this laptop and your connected services.`,
+      `Local: files, folders, docs, repo status, code generation, notes, schedules, and safe shell tasks inside allowed roots.`,
+      `Connected: Wix, Notion, Manus, network/device checks, and your cloud AI providers.`,
+      `Default model: local qwen2.5-coder. I can also delegate to Anthropic, OpenAI, Cohere, or OpenRouter for special tasks.`,
+      `Good starters: "make me a draft note", "summarize this repo", "work on desktop\\\\ZEN Docs\\\\file.md | improve it", or "/capabilities".`
+    ].join("\n");
+  }
+
+  if (/\b(what model|which model|default model|are you local|ollama|qwen)\b/.test(lower)) {
+    return [
+      `My default model is local Ollama on this laptop: ${bot.ollamaModel || "qwen2.5-coder:7b"}.`,
+      `That is the supervisor/default path so routine chat does not need paid usage.`,
+      `If you ask for heavier outside help, I can also switch or delegate to your other configured providers.`
+    ].join("\n");
+  }
+
+  if (/\b(files|folders|desktop|documents|repo|project|laptop|apps|notion|wix|manus|providers|models)\b/.test(lower) && /\b(what|which|can you|do you|access|see|use)\b/.test(lower)) {
+    return [
+      `I can work inside my allowed roots on this laptop, including the project workspace and Desktop-based document folders.`,
+      `I can inspect files, create docs, summarize projects, and use connected integrations like Wix, Notion, and Manus when configured.`,
+      `If you want, ask naturally like "show me what files you can work with" or use "/roots", "/docs", "/project", or "/capabilities".`
+    ].join("\n");
+  }
+
+  if (/\b(show me|open|list|summarize)\b/.test(lower) && /\b(project|repo|files|documents|docs)\b/.test(lower)) {
+    return "";
+  }
+
+  if (state && state.capture && state.capture.targetPath) {
+    return "";
+  }
+
+  return "";
 }
 
 function requireWixConfig() {
@@ -3964,9 +4014,15 @@ async function handleMessage(bot, token, message) {
           state = response.state;
         }
       } else {
+        const quickReply = conversationalQuickReply(bot, text, roots, state);
         state = pushChatMessage(state, "user", text);
-        reply = await handleNaturalLanguage(bot, text, roots, state);
-        extra = replyMarkupForCommand("menu");
+        if (quickReply) {
+          reply = quickReply;
+          extra = replyMarkupForCommand("menu");
+        } else {
+          reply = await handleNaturalLanguage(bot, text, roots, state);
+          extra = replyMarkupForCommand("menu");
+        }
       }
     }
     await sendTelegramText(token, chatId, reply, extra);
