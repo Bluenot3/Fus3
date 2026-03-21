@@ -38,6 +38,7 @@ const CHAT_DIR = path.join(STORAGE_DIR, "chats");
 const SCHEDULES_FILE = path.join(STORAGE_DIR, "schedules.json");
 const DEVICES_FILE = path.join(STORAGE_DIR, "devices.json");
 const AGENT_TASKS_FILE = path.join(STORAGE_DIR, "agent-tasks.json");
+const MEMORIES_FILE = path.join(STORAGE_DIR, "memories.json");
 const ACTIVE_AGENT_TASKS = new Set();
 const DEFAULT_TIMEOUT_MS = 20000;
 const TELEGRAM_LIMIT = 3900;
@@ -245,10 +246,10 @@ function startTypingLoop(token, chatId) {
 function commandKeyboard() {
   return {
     keyboard: [
-      [{ text: "/menu" }, { text: "/status" }, { text: "/capabilities" }],
+      [{ text: "/menu" }, { text: "/brief" }, { text: "/status" }],
       [{ text: "/docs" }, { text: "/newdoc" }, { text: "/workon" }],
       [{ text: "/autopilot" }, { text: "/squad" }, { text: "/tasks" }],
-      [{ text: "/providers" }, { text: "/models" }, { text: "/clear" }]
+      [{ text: "/providers" }, { text: "/models" }, { text: "/memories" }]
     ],
     resize_keyboard: true,
     is_persistent: true
@@ -289,6 +290,8 @@ function wixInlineKeyboard() {
 function projectInlineKeyboard() {
   return inlineKeyboard([
     [{ text: "Files", data: "cmd:files" }, { text: "Git Status", data: "cmd:gitstatus" }],
+    [{ text: "Brief", data: "cmd:brief" }, { text: "Docs", data: "cmd:docs" }],
+    [{ text: "Clipboard", data: "cmd:clipboard" }, { text: "Memories", data: "cmd:memories" }],
     [{ text: "Git Log", data: "cmd:gitlog" }, { text: "Find package", data: "cmd:find package" }],
     [{ text: "Tree", data: "cmd:tree" }, { text: "Workbench", data: "nav:build" }],
     [{ text: "Home", data: "nav:home" }]
@@ -399,6 +402,7 @@ function dashboardText(bot) {
     "",
     `Default supervisor: local qwen2.5-coder (${bot.ollamaModel || "qwen2.5-coder:7b"})`,
     "Quickest phone flows:",
+    "- /brief for a fast mobile status snapshot",
     "- /newdoc to create a document",
     "- /workon to hand a document to the agent",
     "- /autopilot to let the bot choose the best provider",
@@ -421,7 +425,8 @@ function dashboardInlineKeyboard() {
 function controlInlineKeyboard() {
   return inlineKeyboard([
     [{ text: "Status", data: "cmd:status" }, { text: "Health", data: "cmd:health" }],
-    [{ text: "Project", data: "cmd:project" }, { text: "Workbench", data: "cmd:workbench" }],
+    [{ text: "Brief", data: "cmd:brief" }, { text: "Project", data: "cmd:project" }],
+    [{ text: "Workbench", data: "cmd:workbench" }, { text: "Clipboard", data: "cmd:clipboard" }],
     [{ text: "Models", data: "cmd:models" }, { text: "Providers", data: "cmd:providers" }],
     [{ text: "Build Mode", data: "cmd:mode build" }, { text: "Tasks", data: "cmd:tasks" }],
     [{ text: "Home", data: "nav:dashboard" }]
@@ -448,6 +453,7 @@ function devicesInlineKeyboard() {
 function buildInlineKeyboard() {
   return inlineKeyboard([
     [{ text: "Workbench", data: "cmd:workbench" }, { text: "Mode Build", data: "cmd:mode build" }],
+    [{ text: "Brief", data: "cmd:brief" }, { text: "Memories", data: "cmd:memories" }],
     [{ text: "Ideas", data: "cmd:ideas app ideas for my repo" }, { text: "Plan", data: "cmd:planbuild build a new polished dashboard" }],
     [{ text: "Outline", data: "cmd:outline build a launch-ready execution outline" }, { text: "Draft", data: "cmd:draft telegram-draft | first draft created from Telegram" }],
     [{ text: "HTML", data: "cmd:html scratch\\prototype.html | build a polished landing page" }, { text: "Spec", data: "cmd:spec docs\\idea.md | outline a project spec" }],
@@ -484,7 +490,7 @@ function replyMarkupForCommand(command, forceInline = false) {
         ? scheduleInlineKeyboard()
       : command === "network" || command === "wifi" || command === "ping" || command === "ports"
         ? networkInlineKeyboard()
-        : command === "files" || command === "docs" || command === "viewdoc" || command === "find" || command === "grep" || command === "gitstatus" || command === "gitlog" || command === "project"
+        : command === "files" || command === "docs" || command === "viewdoc" || command === "find" || command === "grep" || command === "gitstatus" || command === "gitlog" || command === "project" || command === "brief" || command === "clipboard" || command === "clipboardset" || command === "remember" || command === "memories" || command === "forget"
           ? projectInlineKeyboard()
           : defaultInlineKeyboard();
 
@@ -544,6 +550,21 @@ async function readAgentTasks() {
 async function writeAgentTasks(tasks) {
   await fsp.mkdir(STORAGE_DIR, { recursive: true });
   await fsp.writeFile(AGENT_TASKS_FILE, JSON.stringify({ tasks }, null, 2), "utf8");
+}
+
+async function readMemories() {
+  try {
+    const raw = await fsp.readFile(MEMORIES_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed.memories) ? parsed.memories : [];
+  } catch {
+    return [];
+  }
+}
+
+async function writeMemories(memories) {
+  await fsp.mkdir(STORAGE_DIR, { recursive: true });
+  await fsp.writeFile(MEMORIES_FILE, JSON.stringify({ memories }, null, 2), "utf8");
 }
 
 function existingRoots(paths) {
@@ -1430,6 +1451,181 @@ async function projectOverview(roots) {
     "Recent commits",
     recent.stdout || "No commits found."
   ].join("\n"));
+}
+
+async function recentDocumentItems(roots, limit = 5) {
+  const desktopRoot = roots.find((root) => root.toLowerCase().endsWith(`${path.sep}desktop`));
+  const candidates = [
+    desktopRoot ? path.join(desktopRoot, "ZEN Docs") : "",
+    desktopRoot ? path.join(desktopRoot, "ZEN Intake") : "",
+    desktopRoot ? path.join(desktopRoot, "ZEN Agent Jobs") : ""
+  ].filter(Boolean);
+
+  const items = [];
+  for (const folder of candidates) {
+    if (!fs.existsSync(folder)) {
+      continue;
+    }
+    const entries = await fsp.readdir(folder, { withFileTypes: true });
+    for (const entry of entries) {
+      const fullPath = path.join(folder, entry.name);
+      const stats = await fsp.stat(fullPath);
+      items.push({
+        fullPath,
+        name: entry.name,
+        isDirectory: entry.isDirectory(),
+        modifiedAt: stats.mtime.getTime()
+      });
+    }
+  }
+
+  return items.sort((a, b) => b.modifiedAt - a.modifiedAt).slice(0, limit);
+}
+
+async function mobileBrief(bot, chatId, roots) {
+  const cwd = roots[0];
+  const [wifi, internetCheck, docs, tasks, schedules, memories] = await Promise.all([
+    shellExec("(netsh wlan show interfaces | Select-String '^[ ]*SSID[ ]*:[ ]*(.+)$' | Select-Object -First 1).Matches.Groups[1].Value", cwd),
+    shellExec("(Test-NetConnection 1.1.1.1 -Port 443 -WarningAction SilentlyContinue).TcpTestSucceeded", cwd),
+    recentDocumentItems(roots, 5),
+    readAgentTasks(),
+    readSchedules(),
+    readMemories()
+  ]);
+
+  const recentTasks = tasks.filter((task) => task.botId === bot.id && String(task.chatId) === String(chatId));
+  const recentSchedules = schedules.filter((schedule) => schedule.botId === bot.id && String(schedule.chatId) === String(chatId));
+  const chatMemories = memories.filter((memory) => memory.botId === bot.id && String(memory.chatId) === String(chatId));
+  const online = /true/i.test(internetCheck.stdout || "");
+
+  return truncateForTelegram([
+    `${bot.name} mobile brief`,
+    "",
+    `AI: ${selectionSummary(bot)}`,
+    `Wi-Fi: ${wifi.stdout || "unknown"}`,
+    `Internet: ${online ? "reachable" : "uncertain"}`,
+    `Primary root: ${cwd}`,
+    `Tasks: ${recentTasks.filter((task) => task.status === "running").length} running, ${recentTasks.length} total`,
+    `Schedules: ${recentSchedules.length}`,
+    `Saved memories: ${chatMemories.length}`,
+    "",
+    "Recent docs",
+    ...(docs.length ? docs.map((item) => `- ${item.name}`) : ["- none yet"]),
+    "",
+    "Best quick actions",
+    "- /newdoc title | content",
+    "- /workon path | objective",
+    "- /clipboard and /clipboardset text",
+    "- /remember title | note"
+  ].join("\n"));
+}
+
+async function clipboardCommand() {
+  const result = await shellExec("$value = Get-Clipboard -Raw; if ($null -eq $value) { '' } else { $value }", ROOT);
+  if (result.error && !result.stdout) {
+    throw new Error(result.stderr || "Could not read the clipboard.");
+  }
+  const value = String(result.stdout || "").trim();
+  if (!value) {
+    return "Clipboard is empty or does not currently contain plain text.";
+  }
+  return truncateForTelegram(`Clipboard\n\n${value}`);
+}
+
+async function clipboardSetCommand(args) {
+  const value = String(args || "");
+  if (!value.trim()) {
+    throw new Error("Use /clipboardset text");
+  }
+  const base64 = Buffer.from(value, "utf8").toString("base64");
+  const result = await shellExec(
+    `$text = [System.Text.Encoding]::UTF8.GetString([System.Convert]::FromBase64String('${base64}')); Set-Clipboard -Value $text`,
+    ROOT
+  );
+  if (result.error) {
+    throw new Error(result.stderr || "Could not update the clipboard.");
+  }
+  return `Clipboard updated (${value.length} chars).`;
+}
+
+function previewText(value, max = 140) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return text.length > max ? `${text.slice(0, max - 3)}...` : text;
+}
+
+function describeMemory(memory) {
+  return `#${memory.shortId} ${memory.title || "Note"}\n${previewText(memory.content, 180)}\n${new Date(memory.createdAt).toLocaleString()}`;
+}
+
+async function rememberCommand(bot, chatId, args) {
+  const [rawTitle, ...rest] = String(args || "").split("|");
+  const title = String(rawTitle || "").trim();
+  const content = rest.length ? rest.join("|").trim() : title;
+  if (!content) {
+    throw new Error("Use /remember title | note");
+  }
+
+  const memories = await readMemories();
+  const id = makeId("memory");
+  const memory = {
+    id,
+    shortId: id.split("-")[1],
+    botId: bot.id,
+    chatId: String(chatId),
+    title: rest.length ? title : previewText(content, 48),
+    content,
+    createdAt: nowIso()
+  };
+  memories.push(memory);
+  await writeMemories(memories.slice(-500));
+  return `Saved memory\n\n${describeMemory(memory)}`;
+}
+
+async function memoriesCommand(bot, chatId, args) {
+  const query = String(args || "").trim().toLowerCase();
+  const memories = (await readMemories())
+    .filter((memory) => memory.botId === bot.id && String(memory.chatId) === String(chatId))
+    .filter((memory) => !query || `${memory.title || ""}\n${memory.content || ""}`.toLowerCase().includes(query))
+    .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
+
+  if (!memories.length) {
+    return query
+      ? `No memories matched "${query}".`
+      : "No saved memories yet.\n\nUse /remember title | note";
+  }
+
+  return truncateForTelegram([
+    query ? `Saved memories matching "${query}"` : "Saved memories",
+    "",
+    ...memories.slice(0, 10).map((memory) => describeMemory(memory))
+  ].join("\n\n"));
+}
+
+async function forgetMemoryCommand(bot, chatId, args) {
+  const token = String(args || "").trim().toLowerCase();
+  if (!token) {
+    throw new Error("Use /forget memory-id-or-text");
+  }
+
+  const memories = await readMemories();
+  const index = memories.findIndex((memory) =>
+    memory.botId === bot.id &&
+    String(memory.chatId) === String(chatId) &&
+    (
+      String(memory.shortId || "").toLowerCase() === token ||
+      String(memory.id || "").toLowerCase() === token ||
+      String(memory.title || "").toLowerCase().includes(token) ||
+      String(memory.content || "").toLowerCase().includes(token)
+    )
+  );
+
+  if (index < 0) {
+    throw new Error(`Could not find a saved memory matching "${args}".`);
+  }
+
+  const [removed] = memories.splice(index, 1);
+  await writeMemories(memories);
+  return `Removed memory #${removed.shortId} (${removed.title || "Note"}).`;
 }
 
 async function fetchWebPage(rawUrl) {
@@ -2872,6 +3068,7 @@ function helpText(bot) {
     "/menu - show the quick action menu again",
     "/workbench - open the build-focused tool panel",
     "/mode read|build - switch natural-language behavior",
+    "/brief - show a compact on-the-go control snapshot",
     "/status - show current laptop bot status",
     "/health - show connection and runner health",
     "/roots - list allowed roots",
@@ -2885,6 +3082,11 @@ function helpText(bot) {
     "/draft title | optional content - create a fast working draft on Desktop",
     "/docs [path] - list recent documents and work folders",
     "/workon path | objective - send a document into autopilot",
+    "/clipboard - show the current text clipboard",
+    "/clipboardset text - replace the current text clipboard",
+    "/remember title | note - save a quick persistent note for this chat",
+    "/memories [query] - list saved notes for this chat",
+    "/forget id-or-text - remove one saved note",
     "/write path | content - write a file",
     "/append path | content - append to a file",
     "/mkdir path - create a directory",
@@ -2972,6 +3174,7 @@ function telegramCommandList() {
     { command: "workbench", description: "Open the build tool panel" },
     { command: "mode", description: "Switch read/build behavior" },
     { command: "menu", description: "Show the quick action menu" },
+    { command: "brief", description: "Show a compact mobile control snapshot" },
     { command: "status", description: "Show bot and workspace status" },
     { command: "health", description: "Check runner, Wi-Fi, internet, and Ollama" },
     { command: "files", description: "List files in a folder" },
@@ -2979,6 +3182,11 @@ function telegramCommandList() {
     { command: "newdoc", description: "Create a markdown document on Desktop" },
     { command: "draft", description: "Create a quick working draft document" },
     { command: "workon", description: "Send a document into autopilot" },
+    { command: "clipboard", description: "Read the current text clipboard" },
+    { command: "clipboardset", description: "Replace the current text clipboard" },
+    { command: "memories", description: "List saved quick notes for this chat" },
+    { command: "remember", description: "Save a quick note for this chat" },
+    { command: "forget", description: "Delete one saved quick note" },
     { command: "tree", description: "Show a file tree" },
     { command: "project", description: "Summarize the current project" },
     { command: "fileinfo", description: "Show file details" },
@@ -3569,6 +3777,9 @@ async function executeTelegramCommand(bot, token, command, args, roots, chatId) 
   if (command === "files") {
     return { text: await listFiles(args, roots), extra: replyMarkupForCommand(command) };
   }
+  if (command === "brief") {
+    return { text: await mobileBrief(bot, chatId, roots), extra: replyMarkupForCommand(command) };
+  }
   if (command === "docs") {
     return { text: await listRecentDocuments(roots, args), extra: replyMarkupForCommand(command) };
   }
@@ -3601,6 +3812,21 @@ async function executeTelegramCommand(bot, token, command, args, roots, chatId) 
   }
   if (command === "workon") {
     return { text: await workOnDocumentCommand(bot, token, chatId, roots, args), extra: replyMarkupForCommand("tasks") };
+  }
+  if (command === "clipboard") {
+    return { text: await clipboardCommand(), extra: replyMarkupForCommand(command) };
+  }
+  if (command === "clipboardset") {
+    return { text: await clipboardSetCommand(args), extra: replyMarkupForCommand(command) };
+  }
+  if (command === "remember") {
+    return { text: await rememberCommand(bot, chatId, args), extra: replyMarkupForCommand(command) };
+  }
+  if (command === "memories") {
+    return { text: await memoriesCommand(bot, chatId, args), extra: replyMarkupForCommand(command) };
+  }
+  if (command === "forget") {
+    return { text: await forgetMemoryCommand(bot, chatId, args), extra: replyMarkupForCommand(command) };
   }
   if (command === "write") {
     return { text: await writeFileCommand(args, roots, false), extra: replyMarkupForCommand(command) };
@@ -4074,6 +4300,9 @@ async function ensureDirs() {
   }
   if (!fs.existsSync(AGENT_TASKS_FILE)) {
     await writeAgentTasks([]);
+  }
+  if (!fs.existsSync(MEMORIES_FILE)) {
+    await writeMemories([]);
   }
 }
 
