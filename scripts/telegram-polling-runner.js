@@ -374,9 +374,11 @@ function buildInlineKeyboard() {
   return inlineKeyboard([
     [{ text: "Workbench", data: "cmd:workbench" }, { text: "Mode Build", data: "cmd:mode build" }],
     [{ text: "Ideas", data: "cmd:ideas app ideas for my repo" }, { text: "Plan", data: "cmd:planbuild build a new polished dashboard" }],
+    [{ text: "Outline", data: "cmd:outline build a launch-ready execution outline" }, { text: "Draft", data: "cmd:draft telegram-draft | first draft created from Telegram" }],
     [{ text: "HTML", data: "cmd:html scratch\\prototype.html | build a polished landing page" }, { text: "Spec", data: "cmd:spec docs\\idea.md | outline a project spec" }],
     [{ text: "Start Intake", data: "cmd:intake dispute-case | create a detailed factual plan and draft emails" }, { text: "Case Pack", data: "cmd:casepack desktop\\ZEN Intake\\sample.txt | build a full case room" }],
     [{ text: "New Doc", data: "cmd:newdoc idea-note | created from Telegram" }, { text: "Docs", data: "cmd:docs" }],
+    [{ text: "Summarize", data: "cmd:summarize desktop\\ZEN Intake\\sample.txt | summarize the main points and next actions" }, { text: "Work On Doc", data: "cmd:workon desktop\\ZEN Docs\\sample.md | improve this and make it actionable" }],
     [{ text: "Doc Agent", data: "cmd:docagent desktop\\ZEN Intake\\sample.txt | build a detailed execution pack" }, { text: "Sheet Agent", data: "cmd:sheetagent desktop\\sample.xlsx | turn this sheet into an action plan" }],
     [{ text: "Site Agent", data: "cmd:siteagent wix | audit the site and suggest stronger next steps" }, { text: "Tasks", data: "nav:tasks" }],
     [{ text: "Autopilot", data: "cmd:autopilot general | desktop\\ZEN Intake\\sample.txt | choose the best provider and build it" }, { text: "Squad", data: "cmd:squad general | desktop\\ZEN Intake\\sample.txt | run a multi-model synthesis" }],
@@ -696,6 +698,24 @@ function parseQuickIntent(text) {
     const rest = value.replace(/^(work\s+on|assign\s+doc|assign\s+document)\b[:\s-]*/i, "").trim();
     if (rest) {
       return { command: "workon", args: rest };
+    }
+  }
+  if (/^(brainstorm|ideas)\b/.test(lower)) {
+    const rest = value.replace(/^(brainstorm|ideas)\b[:\s-]*/i, "").trim();
+    return { command: "ideas", args: rest || "new high-impact things to build" };
+  }
+  if (/^(outline|plan)\b/.test(lower)) {
+    const rest = value.replace(/^(outline|plan)\b[:\s-]*/i, "").trim();
+    return { command: "outline", args: rest || "build a strong execution outline" };
+  }
+  if (/^(draft)\b/.test(lower)) {
+    const rest = value.replace(/^(draft)\b[:\s-]*/i, "").trim();
+    return { command: "draft", args: rest || "telegram-draft | first draft created from Telegram" };
+  }
+  if (/^(summarize|summary)\b/.test(lower)) {
+    const rest = value.replace(/^(summarize|summary)\b[:\s-]*/i, "").trim();
+    if (rest) {
+      return { command: "summarize", args: rest };
     }
   }
   if (/^(providers|models|tasks)\b/.test(lower)) {
@@ -2737,6 +2757,7 @@ function helpText(bot) {
     "/read path - read a text file",
     "/viewdoc path - preview a document file",
     "/newdoc title | optional content - create a markdown document on Desktop",
+    "/draft title | optional content - create a fast working draft on Desktop",
     "/docs [path] - list recent documents and work folders",
     "/workon path | objective - send a document into autopilot",
     "/write path | content - write a file",
@@ -2747,11 +2768,13 @@ function helpText(bot) {
     "/run command - run a PowerShell command in the primary root",
     "/ask prompt - send a prompt to Ollama",
     "/ideas prompt - brainstorm things to build",
+    "/outline prompt - create a stronger execution outline",
     "/planbuild prompt - create a build plan",
     "/intake name-or-path | objective - start capturing long text into a desktop file",
     "/capturedone - finish intake and generate plan files",
     "/capturecancel - cancel the active intake session",
     "/analyze path | objective - generate a full case room from a saved file",
+    "/summarize path | objective - summarize a file into key points and actions",
     "/casepack path | objective - same as /analyze but named for case work",
     "/html path | prompt - generate a polished HTML app",
     "/component path | prompt - generate a React component",
@@ -2829,6 +2852,7 @@ function telegramCommandList() {
     { command: "files", description: "List files in a folder" },
     { command: "docs", description: "List recent documents and work folders" },
     { command: "newdoc", description: "Create a markdown document on Desktop" },
+    { command: "draft", description: "Create a quick working draft document" },
     { command: "workon", description: "Send a document into autopilot" },
     { command: "tree", description: "Show a file tree" },
     { command: "project", description: "Summarize the current project" },
@@ -2839,7 +2863,9 @@ function telegramCommandList() {
     { command: "devicescan", description: "Quick scan the local subnet" },
     { command: "wifi", description: "Show current Wi-Fi details" },
     { command: "ideas", description: "Brainstorm things to build" },
+    { command: "outline", description: "Create a strong execution outline" },
     { command: "planbuild", description: "Create a build plan" },
+    { command: "summarize", description: "Summarize a file into main points" },
     { command: "intake", description: "Capture long text into a file" },
     { command: "capturedone", description: "Finish intake and generate a case room" },
     { command: "casepack", description: "Generate a case room from a file" },
@@ -3436,6 +3462,9 @@ async function executeTelegramCommand(bot, token, command, args, roots, chatId) 
   if (command === "newdoc") {
     return { text: await createDocumentCommand(args, roots), extra: replyMarkupForCommand(command) };
   }
+  if (command === "quickdoc" || command === "draft") {
+    return { text: await createDocumentCommand(args, roots), extra: replyMarkupForCommand("newdoc") };
+  }
   if (command === "workon") {
     return { text: await workOnDocumentCommand(bot, token, chatId, roots, args), extra: replyMarkupForCommand("tasks") };
   }
@@ -3466,7 +3495,13 @@ async function executeTelegramCommand(bot, token, command, args, roots, chatId) 
   if (command === "ideas") {
     return { text: await ideasCommand(bot, args), extra: replyMarkupForCommand("workbench") };
   }
+  if (command === "brainstorm") {
+    return { text: await ideasCommand(bot, args), extra: replyMarkupForCommand("workbench") };
+  }
   if (command === "planbuild") {
+    return { text: await planBuildCommand(bot, args), extra: replyMarkupForCommand("workbench") };
+  }
+  if (command === "outline") {
     return { text: await planBuildCommand(bot, args), extra: replyMarkupForCommand("workbench") };
   }
   if (command === "intake") {
@@ -3487,6 +3522,9 @@ async function executeTelegramCommand(bot, token, command, args, roots, chatId) 
     return { text: "Intake session cancelled.", extra: replyMarkupForCommand("workbench"), state };
   }
   if (command === "analyze") {
+    return { text: await analyzeFileCommand(bot, roots, args), extra: replyMarkupForCommand("workbench") };
+  }
+  if (command === "summarize") {
     return { text: await analyzeFileCommand(bot, roots, args), extra: replyMarkupForCommand("workbench") };
   }
   if (command === "casepack") {
@@ -3887,6 +3925,12 @@ async function ensureDirs() {
 
 async function configureTelegramSurface(token) {
   await telegram(token, "setMyCommands", { commands: telegramCommandList() }).catch(() => {});
+  await telegram(token, "setMyDescription", {
+    description: "Local-first AI command center for files, documents, build tasks, Wix, Notion, network tools, and multi-model agent work."
+  }).catch(() => {});
+  await telegram(token, "setMyShortDescription", {
+    short_description: "Local qwen-powered AI operator with docs, build, and agent tools."
+  }).catch(() => {});
   await telegram(token, "setChatMenuButton", {
     menu_button: {
       type: "commands"
