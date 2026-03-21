@@ -768,6 +768,39 @@ function formatBytes(size) {
   return `${value.toFixed(value >= 100 || index === 0 ? 0 : 1)} ${units[index]}`;
 }
 
+function extractNaturalDocTitle(text) {
+  const raw = String(text || "").trim();
+  const called = raw.match(/\b(?:called|named|titled)\s+["“]?([^"”]+?)["”]?(?:\s+(?:on|in)\s+(?:the\s+)?desktop)?$/i);
+  if (called && called[1]) {
+    return called[1].trim();
+  }
+
+  return raw
+    .replace(/^(?:please\s+)?(?:(?:can|could|will|would)\s+you\s+)?(?:create|make|new|write|draft)\s+(?:me\s+)?/i, "")
+    .replace(/\b(?:on|in)\s+(?:the\s+)?desktop\b/ig, "")
+    .replace(/\b(?:markdown\s+file|md\s+file|text\s+file|doc(?:ument)?|note|draft|file)\b/ig, "")
+    .replace(/^(?:a|an|the)\s+/i, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function extractNaturalFolderPath(text) {
+  const raw = String(text || "").trim();
+  const nameMatch = raw.match(/\b(?:called|named|titled)\s+["“]?([^"”]+?)["”]?(?:\s+(?:on|in)\s+(?:the\s+)?desktop)?$/i);
+  const folderName = (nameMatch && nameMatch[1] ? nameMatch[1] : raw
+    .replace(/^(?:please\s+)?(?:(?:can|could|will|would)\s+you\s+)?(?:create|make|new)\s+(?:me\s+)?/i, "")
+    .replace(/\b(?:folder|directory)\b/ig, "")
+    .replace(/\b(?:on|in)\s+(?:the\s+)?desktop\b/ig, "")
+    .replace(/^(?:a|an|the)\s+/i, "")
+    .replace(/\s+/g, " ")
+    .trim());
+
+  if (!folderName) {
+    return "";
+  }
+  return /\b(?:on|in)\s+(?:the\s+)?desktop\b/i.test(raw) ? `desktop\\${folderName}` : folderName;
+}
+
 function parseQuickIntent(text) {
   const value = String(text || "").trim();
   const lower = value.toLowerCase();
@@ -783,9 +816,31 @@ function parseQuickIntent(text) {
   if (/^(docs|documents)\b/.test(lower)) {
     return { command: "docs", args: "" };
   }
+  if (/^(?:show|list|open|what(?:'s| is)\s+on)\s+(?:my\s+)?desktop\b/.test(lower) || /^desktop\b/.test(lower)) {
+    return { command: "files", args: "desktop" };
+  }
+  if (/^(?:show|read|what(?:'s| is)\s+in)\s+(?:the\s+)?clipboard\b/.test(lower) || /^clipboard\b/.test(lower)) {
+    return { command: "clipboard", args: "" };
+  }
+  if (/^(?:set|copy(?:\s+to)?|put(?:\s+this)?\s+in)\s+(?:the\s+)?clipboard\b/.test(lower)) {
+    const content = value.replace(/^(?:set|copy(?:\s+to)?|put(?:\s+this)?\s+in)\s+(?:the\s+)?clipboard\b[:\s-]*/i, "").trim();
+    if (content) {
+      return { command: "clipboardset", args: content };
+    }
+  }
   if (/^(new\s+doc|new\s+dock|new\s+document|create\s+doc|create\s+document)\b/.test(lower)) {
     const title = value.replace(/^(new\s+doc|new\s+dock|new\s+document|create\s+doc|create\s+document)\b[:\s-]*/i, "").trim();
     return { command: "newdoc", args: title || "quick-note" };
+  }
+  if (/^(?:please\s+)?(?:(?:can|could|will|would)\s+you\s+)?(?:create|make|new|write|draft)\b/i.test(lower) && /\b(doc(?:ument)?|note|draft|markdown|text\s+file|file)\b/i.test(lower)) {
+    const title = extractNaturalDocTitle(value);
+    return { command: "newdoc", args: title || "quick-note" };
+  }
+  if (/^(?:please\s+)?(?:(?:can|could|will|would)\s+you\s+)?(?:create|make|new)\b/i.test(lower) && /\b(folder|directory)\b/i.test(lower)) {
+    const folderPath = extractNaturalFolderPath(value);
+    if (folderPath) {
+      return { command: "mkdir", args: folderPath };
+    }
   }
   if (/^(work\s+on|assign\s+doc|assign\s+document)\b/.test(lower)) {
     const rest = value.replace(/^(work\s+on|assign\s+doc|assign\s+document)\b[:\s-]*/i, "").trim();
