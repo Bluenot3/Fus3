@@ -51,6 +51,7 @@ const TASK_SOURCE_MAX_CHARS = 28000;
 const UPDATE_DEDUPE_TTL_MS = 10 * 60 * 1000;
 const REPLY_DEDUPE_TTL_MS = 20 * 1000;
 const STALE_UPDATE_MS = 2 * 60 * 1000;
+const CALLBACK_DATA_MAX_BYTES = 60;
 const DANGEROUS_COMMAND_PATTERNS = [
   /\bremove-item\b/i,
   /\bdel\b/i,
@@ -75,6 +76,7 @@ const DANGEROUS_COMMAND_PATTERNS = [
 const RECENT_UPDATE_KEYS = new Map();
 const RECENT_REPLY_KEYS = new Map();
 const INFLIGHT_CHAT_KEYS = new Set();
+const CALLBACK_ALIASES = new Map();
 let TELEGRAM_SEND_MUTE_UNTIL = 0;
 
 loadEnvFile(path.join(ROOT, ".env.local"));
@@ -261,10 +263,25 @@ function inlineKeyboard(rows) {
     inline_keyboard: rows.map((row) =>
       row.map((button) => ({
         text: button.text,
-        callback_data: button.data
+        callback_data: encodeCallbackData(button.data)
       }))
     )
   };
+}
+
+function encodeCallbackData(value) {
+  const raw = String(value || "").trim();
+  if (Buffer.byteLength(raw, "utf8") <= CALLBACK_DATA_MAX_BYTES) {
+    return raw;
+  }
+  const alias = `act:${crypto.createHash("sha1").update(raw).digest("hex").slice(0, 16)}`;
+  CALLBACK_ALIASES.set(alias, raw);
+  return alias;
+}
+
+function resolveCallbackData(value) {
+  const raw = String(value || "").trim();
+  return CALLBACK_ALIASES.get(raw) || raw;
 }
 
 function homeInlineKeyboard() {
@@ -344,12 +361,12 @@ function aiInlineKeyboard() {
 function tasksInlineKeyboard() {
   return inlineKeyboard([
     [{ text: "Task List", data: "cmd:tasks" }, { text: "Task Help", data: "cmd:agenthelp" }],
-    [{ text: "Doc Agent", data: "cmd:docagent desktop\\ZEN Intake\\sample.txt | build a detailed working plan" }],
-    [{ text: "Claude Doc", data: "cmd:delegate anthropic | doc | desktop\\ZEN Intake\\sample.txt | build a nuanced structured brief" }],
-    [{ text: "Autopilot", data: "cmd:autopilot doc | desktop\\ZEN Intake\\sample.txt | choose the best agent and build the pack" }],
-    [{ text: "Squad", data: "cmd:squad doc | desktop\\ZEN Intake\\sample.txt | run a multi-agent comparison and synthesis" }],
-    [{ text: "Sheet Agent", data: "cmd:sheetagent desktop\\sample.xlsx | summarize this sheet and produce actions" }],
-    [{ text: "Site Agent", data: "cmd:siteagent wix | audit the site and suggest upgrades" }],
+    [{ text: "Doc Agent", data: "cmd:docagent desktop\\ZEN Intake\\sample.txt" }],
+    [{ text: "Claude", data: "cmd:provider anthropic" }, { text: "OpenRouter", data: "cmd:provider openrouter" }],
+    [{ text: "Autopilot", data: "cmd:autopilot doc | desktop\\ZEN Intake\\sample.txt" }],
+    [{ text: "Squad", data: "cmd:squad doc | desktop\\ZEN Intake\\sample.txt" }],
+    [{ text: "Sheet Agent", data: "cmd:sheetagent desktop\\sample.xlsx" }],
+    [{ text: "Site Agent", data: "cmd:siteagent wix" }],
     [{ text: "Home", data: "nav:dashboard" }]
   ]);
 }
@@ -454,15 +471,15 @@ function buildInlineKeyboard() {
   return inlineKeyboard([
     [{ text: "Workbench", data: "cmd:workbench" }, { text: "Mode Build", data: "cmd:mode build" }],
     [{ text: "Brief", data: "cmd:brief" }, { text: "Memories", data: "cmd:memories" }],
-    [{ text: "Ideas", data: "cmd:ideas app ideas for my repo" }, { text: "Plan", data: "cmd:planbuild build a new polished dashboard" }],
-    [{ text: "Outline", data: "cmd:outline build a launch-ready execution outline" }, { text: "Draft", data: "cmd:draft telegram-draft | first draft created from Telegram" }],
-    [{ text: "HTML", data: "cmd:html scratch\\prototype.html | build a polished landing page" }, { text: "Spec", data: "cmd:spec docs\\idea.md | outline a project spec" }],
-    [{ text: "Start Intake", data: "cmd:intake dispute-case | create a detailed factual plan and draft emails" }, { text: "Case Pack", data: "cmd:casepack desktop\\ZEN Intake\\sample.txt | build a full case room" }],
+    [{ text: "Ideas", data: "cmd:ideas app ideas for my repo" }, { text: "Plan", data: "cmd:planbuild polished dashboard" }],
+    [{ text: "Outline", data: "cmd:outline launch-ready outline" }, { text: "Draft", data: "cmd:draft telegram-draft" }],
+    [{ text: "HTML", data: "cmd:html scratch\\prototype.html" }, { text: "Spec", data: "cmd:spec docs\\idea.md" }],
+    [{ text: "Start Intake", data: "cmd:intake dispute-case" }, { text: "Case Pack", data: "cmd:casepack desktop\\ZEN Intake\\sample.txt" }],
     [{ text: "New Doc", data: "cmd:newdoc idea-note | created from Telegram" }, { text: "Docs", data: "cmd:docs" }],
-    [{ text: "Summarize", data: "cmd:summarize desktop\\ZEN Intake\\sample.txt | summarize the main points and next actions" }, { text: "Work On Doc", data: "cmd:workon desktop\\ZEN Docs\\sample.md | improve this and make it actionable" }],
-    [{ text: "Doc Agent", data: "cmd:docagent desktop\\ZEN Intake\\sample.txt | build a detailed execution pack" }, { text: "Sheet Agent", data: "cmd:sheetagent desktop\\sample.xlsx | turn this sheet into an action plan" }],
-    [{ text: "Site Agent", data: "cmd:siteagent wix | audit the site and suggest stronger next steps" }, { text: "Tasks", data: "nav:tasks" }],
-    [{ text: "Autopilot", data: "cmd:autopilot general | desktop\\ZEN Intake\\sample.txt | choose the best provider and build it" }, { text: "Squad", data: "cmd:squad general | desktop\\ZEN Intake\\sample.txt | run a multi-model synthesis" }],
+    [{ text: "Summarize", data: "cmd:summarize desktop\\ZEN Intake\\sample.txt" }, { text: "Work On Doc", data: "cmd:workon desktop\\ZEN Docs\\sample.md" }],
+    [{ text: "Doc Agent", data: "cmd:docagent desktop\\ZEN Intake\\sample.txt" }, { text: "Sheet Agent", data: "cmd:sheetagent desktop\\sample.xlsx" }],
+    [{ text: "Site Agent", data: "cmd:siteagent wix" }, { text: "Tasks", data: "nav:tasks" }],
+    [{ text: "Autopilot", data: "cmd:autopilot general | desktop\\ZEN Intake\\sample.txt" }, { text: "Squad", data: "cmd:squad general | desktop\\ZEN Intake\\sample.txt" }],
     [{ text: "Desktop Files", data: "cmd:files desktop" }],
     [{ text: "Read Mode", data: "cmd:mode read" }, { text: "Home", data: "nav:dashboard" }]
   ]);
@@ -4209,7 +4226,7 @@ async function executeTelegramCommand(bot, token, command, args, roots, chatId) 
 async function handleCallbackQuery(bot, token, callbackQuery) {
   const chatId = callbackQuery.message && callbackQuery.message.chat && callbackQuery.message.chat.id;
   const messageId = callbackQuery.message && callbackQuery.message.message_id;
-  const data = String(callbackQuery.data || "").trim();
+  const data = resolveCallbackData(callbackQuery.data);
   if (!chatId || !messageId || !data) {
     return;
   }
