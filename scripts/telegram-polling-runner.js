@@ -49,6 +49,7 @@ const SCHEDULER_TICK_MS = 15000;
 const TASK_SOURCE_MAX_CHARS = 28000;
 const UPDATE_DEDUPE_TTL_MS = 10 * 60 * 1000;
 const REPLY_DEDUPE_TTL_MS = 20 * 1000;
+const STALE_UPDATE_MS = 2 * 60 * 1000;
 const DANGEROUS_COMMAND_PATTERNS = [
   /\bremove-item\b/i,
   /\bdel\b/i,
@@ -72,6 +73,8 @@ const DANGEROUS_COMMAND_PATTERNS = [
 ];
 const RECENT_UPDATE_KEYS = new Map();
 const RECENT_REPLY_KEYS = new Map();
+const INFLIGHT_CHAT_KEYS = new Set();
+let TELEGRAM_SEND_MUTE_UNTIL = 0;
 
 loadEnvFile(path.join(ROOT, ".env.local"));
 
@@ -159,16 +162,47 @@ function retryAfterMs(error, fallbackMs = 3000) {
   return seconds > 0 ? seconds * 1000 : fallbackMs;
 }
 
+function isTelegramSendMuted() {
+  return Date.now() < TELEGRAM_SEND_MUTE_UNTIL;
+}
+
+function applyTelegramSendMute(error) {
+  TELEGRAM_SEND_MUTE_UNTIL = Math.max(TELEGRAM_SEND_MUTE_UNTIL, Date.now() + retryAfterMs(error, POLL_BACKOFF_MS));
+}
+
+function updateTimestampMs(update) {
+  const unix =
+    Number(update?.message?.date || 0) ||
+    Number(update?.callback_query?.message?.date || 0);
+  return unix > 0 ? unix * 1000 : 0;
+}
+
+function isStaleUpdate(update) {
+  const timestamp = updateTimestampMs(update);
+  return timestamp > 0 && Date.now() - timestamp > STALE_UPDATE_MS;
+}
+
 async function sendTelegramText(token, chatId, text, extra = {}) {
   const normalized = truncateForTelegram(text);
+  if (isTelegramSendMuted()) {
+    return { ok: true, suppressed: true, muted: true };
+  }
   if (touchRecentKey(RECENT_REPLY_KEYS, duplicateReplyKey(chatId, normalized), REPLY_DEDUPE_TTL_MS)) {
     return { ok: true, suppressed: true };
   }
-  return telegram(token, "sendMessage", {
-    chat_id: chatId,
-    text: normalized,
-    ...extra
-  });
+  try {
+    return await telegram(token, "sendMessage", {
+      chat_id: chatId,
+      text: normalized,
+      ...extra
+    });
+  } catch (error) {
+    if (isRateLimitError(error)) {
+      applyTelegramSendMute(error);
+      return { ok: true, suppressed: true, muted: true };
+    }
+    throw error;
+  }
 }
 
 async function sendTelegramDocument(token, chatId, filePath, caption = "") {
@@ -319,6 +353,10 @@ function tasksInlineKeyboard() {
 
 function defaultInlineKeyboard() {
   return homeInlineKeyboard();
+}
+
+function runnerLockPath(botId) {
+  return path.join(STORAGE_DIR, `runner-lock-${botId}.json`);
 }
 
 function navigationScreen(bot, key) {
@@ -3836,6 +3874,12 @@ async function handleCallbackQuery(bot, token, callbackQuery) {
     return;
   }
 
+  const inflightKey = `callback:${chatId}:${messageId}`;
+  if (INFLIGHT_CHAT_KEYS.has(inflightKey)) {
+    return;
+  }
+  INFLIGHT_CHAT_KEYS.add(inflightKey);
+
   try {
     await telegram(token, "answerCallbackQuery", {
       callback_query_id: callbackQuery.id,
@@ -3871,6 +3915,8 @@ async function handleCallbackQuery(bot, token, callbackQuery) {
       text: error.message || "Action failed.",
       show_alert: false
     }).catch(() => {});
+  } finally {
+    INFLIGHT_CHAT_KEYS.delete(inflightKey);
   }
 }
 
@@ -3880,6 +3926,13 @@ async function handleMessage(bot, token, message) {
   if (!chatId || !text) {
     return;
   }
+
+  const inflightKey = `message:${chatId}`;
+  if (INFLIGHT_CHAT_KEYS.has(inflightKey)) {
+    await appendRunnerLog(bot.id, `chat inflight skip chat=${chatId} text=${JSON.stringify(text).slice(0, 120)}`);
+    return;
+  }
+  INFLIGHT_CHAT_KEYS.add(inflightKey);
 
   const roots = getAllowedRoots(bot);
   let state = await readChatState(bot.id, chatId);
@@ -3929,6 +3982,7 @@ async function handleMessage(bot, token, message) {
     }
   } finally {
     stopTyping();
+    INFLIGHT_CHAT_KEYS.delete(inflightKey);
   }
 }
 
@@ -3964,6 +4018,47 @@ async function ensureDirs() {
   }
 }
 
+async function acquireRunnerLock(bot) {
+  const lockPath = runnerLockPath(bot.id);
+  const payload = {
+    pid: process.pid,
+    botId: bot.id,
+    botName: bot.name,
+    createdAt: nowIso()
+  };
+  try {
+    await fsp.writeFile(lockPath, JSON.stringify(payload, null, 2), { encoding: "utf8", flag: "wx" });
+  } catch (error) {
+    if (error && error.code !== "EEXIST") {
+      throw error;
+    }
+    try {
+      const existing = JSON.parse(await fsp.readFile(lockPath, "utf8"));
+      const existingPid = Number(existing && existing.pid || 0);
+      if (existingPid && existingPid !== process.pid) {
+        try {
+          process.kill(existingPid, 0);
+          throw new Error(`Another runner is already active for ${bot.name} (PID ${existingPid}).`);
+        } catch (pidError) {
+          if (pidError && pidError.code === "ESRCH") {
+            await fsp.unlink(lockPath).catch(() => {});
+            await fsp.writeFile(lockPath, JSON.stringify(payload, null, 2), { encoding: "utf8", flag: "wx" });
+            return lockPath;
+          }
+          throw pidError;
+        }
+      }
+    } catch (readError) {
+      if (String(readError && readError.message || "").includes("Another runner is already active")) {
+        throw readError;
+      }
+      await fsp.unlink(lockPath).catch(() => {});
+      await fsp.writeFile(lockPath, JSON.stringify(payload, null, 2), { encoding: "utf8", flag: "wx" });
+    }
+  }
+  return lockPath;
+}
+
 async function configureTelegramSurface(token) {
   await telegram(token, "setMyCommands", { commands: telegramCommandList() }).catch(() => {});
   await telegram(token, "setMyDescription", {
@@ -3988,6 +4083,7 @@ async function main() {
   if (!bot) {
     throw new Error(`Could not find bot for selector "${botArg || "default"}".`);
   }
+  const lockPath = await acquireRunnerLock(bot);
   bot.ollamaModel = bot.ollamaModel || "qwen2.5-coder:7b";
   bot.aiProviderId = "ollama:local";
   bot.modelProvider = "ollama";
@@ -4031,40 +4127,51 @@ async function main() {
     });
   }, SCHEDULER_TICK_MS);
 
-  while (true) {
-    try {
-      const updates = await telegram(token, "getUpdates", {
-        offset,
-        timeout: 45,
-        allowed_updates: ["message", "callback_query"]
-      });
+  try {
+    while (true) {
+      try {
+        const updates = await telegram(token, "getUpdates", {
+          offset,
+          timeout: 45,
+          allowed_updates: ["message", "callback_query"]
+        });
 
-      for (const update of updates) {
-        offset = Math.max(offset, Number(update.update_id) + 1);
-        await fsp.writeFile(stateFile, JSON.stringify({ offset }, null, 2), "utf8");
-        const updateKey = update.message
-          ? `m:${update.message.chat?.id}:${update.message.message_id}`
-          : update.callback_query
-            ? `c:${update.callback_query.id}`
-            : `u:${update.update_id}`;
-        if (touchRecentKey(RECENT_UPDATE_KEYS, updateKey, UPDATE_DEDUPE_TTL_MS)) {
-          await appendRunnerLog(bot.id, `duplicate update skipped ${updateKey}`);
-          continue;
+        for (const update of updates) {
+          offset = Math.max(offset, Number(update.update_id) + 1);
+          await fsp.writeFile(stateFile, JSON.stringify({ offset }, null, 2), "utf8");
+          if (isStaleUpdate(update)) {
+            await appendRunnerLog(bot.id, `stale update skipped ${update.update_id}`);
+            continue;
+          }
+          const updateKey = update.message
+            ? `m:${update.message.chat?.id}:${update.message.message_id}`
+            : update.callback_query
+              ? `c:${update.callback_query.id}`
+              : `u:${update.update_id}`;
+          if (touchRecentKey(RECENT_UPDATE_KEYS, updateKey, UPDATE_DEDUPE_TTL_MS)) {
+            await appendRunnerLog(bot.id, `duplicate update skipped ${updateKey}`);
+            continue;
+          }
+          if (update.message) {
+            await handleMessage(bot, token, update.message);
+          } else if (update.callback_query) {
+            await handleCallbackQuery(bot, token, update.callback_query);
+          }
         }
-        if (update.message) {
-          await handleMessage(bot, token, update.message);
-        } else if (update.callback_query) {
-          await handleCallbackQuery(bot, token, update.callback_query);
+      } catch (error) {
+        if (isRateLimitError(error)) {
+          applyTelegramSendMute(error);
         }
+        await fsp.writeFile(
+          path.join(LOG_DIR, `runner-${bot.id}.log`),
+          `${new Date().toISOString()} polling retry: ${error.message || String(error)}\n`,
+          { flag: "a" }
+        );
+        await new Promise((resolve) => setTimeout(resolve, isRateLimitError(error) ? retryAfterMs(error, POLL_BACKOFF_MS) : POLL_BACKOFF_MS));
       }
-    } catch (error) {
-      await fsp.writeFile(
-        path.join(LOG_DIR, `runner-${bot.id}.log`),
-        `${new Date().toISOString()} polling retry: ${error.message || String(error)}\n`,
-        { flag: "a" }
-      );
-      await new Promise((resolve) => setTimeout(resolve, isRateLimitError(error) ? retryAfterMs(error, POLL_BACKOFF_MS) : POLL_BACKOFF_MS));
     }
+  } finally {
+    await fsp.unlink(lockPath).catch(() => {});
   }
 }
 

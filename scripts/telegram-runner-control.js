@@ -74,6 +74,18 @@ async function ensureDirs() {
   await fsp.mkdir(LOG_DIR, { recursive: true });
 }
 
+async function waitForRunnerExit(bot, timeoutMs = 15000) {
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    const existing = await findRunnerProcesses(bot);
+    if (!existing.length) {
+      return true;
+    }
+    await new Promise((resolve) => setTimeout(resolve, 500));
+  }
+  return false;
+}
+
 async function writePidFile(bot, pid) {
   await fsp.mkdir(STORAGE_DIR, { recursive: true });
   await fsp.writeFile(pidFilePath(bot), String(pid), "utf8");
@@ -89,9 +101,12 @@ async function start(bot) {
   await ensureDirs();
   const existing = await findRunnerProcesses(bot);
   if (existing.length) {
-    await writePidFile(bot, existing[0].ProcessId);
-    console.log(`Runner already active for ${bot} (PID ${existing[0].ProcessId}).`);
-    return;
+    for (const processInfo of existing) {
+      try {
+        await execPowerShell(`Stop-Process -Id ${Number(processInfo.ProcessId)} -Force`);
+      } catch {}
+    }
+    await waitForRunnerExit(bot);
   }
 
   const logs = logPaths(bot);
@@ -127,6 +142,7 @@ async function stop(bot) {
       console.log(`Could not stop runner PID ${processInfo.ProcessId} for ${bot}: ${error.message}`);
     }
   }
+  await waitForRunnerExit(bot);
   await removePidFile(bot);
 }
 
