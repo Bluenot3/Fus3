@@ -2,6 +2,9 @@ function ollamaBaseUrl(bot) {
   return String(bot.ollamaBaseUrl || process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434").replace(/\/+$/, "");
 }
 
+const OLLAMA_MODEL_KEEP_ALIVE = process.env.OLLAMA_KEEP_ALIVE || "8h";
+const OLLAMA_GENERATE_TIMEOUT_MS = Number(process.env.OLLAMA_GENERATE_TIMEOUT_MS || 300000);
+
 async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -298,11 +301,28 @@ function extractOpenAiText(payload) {
 }
 
 async function generateText(bot, prompt, systemPrompt, override = {}) {
-  const modelListing = await listModels(bot, override);
-  const selection = {
-    ...modelListing.selection,
-    model: override.model || modelListing.selection.model || pickCheapestUsefulModel(modelListing.selection.provider, modelListing.models)
-  };
+  let selection = currentSelection(bot, override);
+  let models = [];
+
+  if (!selection.model) {
+    const modelListing = await listModels(bot, override);
+    selection = {
+      ...modelListing.selection,
+      model: override.model || modelListing.selection.model || pickCheapestUsefulModel(modelListing.selection.provider, modelListing.models)
+    };
+    models = modelListing.models;
+  }
+
+  if (!selection.model) {
+    if (selection.provider === "ollama") {
+      const modelListing = await listModels(bot, override);
+      models = modelListing.models;
+      selection = {
+        ...modelListing.selection,
+        model: pickCheapestUsefulModel(modelListing.selection.provider, modelListing.models)
+      };
+    }
+  }
 
   if (!selection.model) {
     throw new Error(`No model is configured for ${selection.label}. Use /models and /model to choose one.`);
@@ -316,9 +336,10 @@ async function generateText(bot, prompt, systemPrompt, override = {}) {
         model: selection.model,
         system: systemPrompt || bot.systemPrompt || "",
         prompt,
-        stream: false
+        stream: false,
+        keep_alive: OLLAMA_MODEL_KEEP_ALIVE
       })
-    }, 60000);
+    }, OLLAMA_GENERATE_TIMEOUT_MS);
 
     const payload = await response.json().catch(() => ({}));
     if (!response.ok || !payload.response) {

@@ -154,6 +154,23 @@ async function sendTelegramDocument(token, chatId, filePath, caption = "") {
   return payload.result;
 }
 
+function startTypingLoop(token, chatId) {
+  let stopped = false;
+  let timer = null;
+
+  const ping = () => telegram(token, "sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => {});
+  ping();
+  timer = setInterval(ping, 4000);
+
+  return () => {
+    if (stopped) {
+      return;
+    }
+    stopped = true;
+    clearInterval(timer);
+  };
+}
+
 function commandKeyboard() {
   return {
     keyboard: [
@@ -1540,13 +1557,18 @@ function fallbackSelectionChain(bot, currentId = "") {
 function userFacingErrorMessage(error) {
   const message = error && (error.message || String(error)) ? String(error.message || error) : "Unknown error";
   if (/aborted|aborterror/i.test(message)) {
-    return "The AI request timed out before a model finished. Try again, or switch to a faster cloud provider with /provider anthropic or /provider openrouter.";
+    return "The AI request timed out before a model finished. The local qwen model is still the default, but if it is busy loading you can retry in a moment or temporarily switch with /provider anthropic or /provider openrouter.";
   }
   return message;
 }
 
 function fastChatProfile(bot) {
-  const preferred = ["anthropic", "openrouter", "openai", "cohere", "ollama"];
+  const current = currentSelection(bot);
+  if (current && current.provider === "ollama") {
+    return current;
+  }
+
+  const preferred = ["ollama", "anthropic", "openrouter", "openai", "cohere"];
   const profiles = configuredProviderProfiles(bot);
   for (const provider of preferred) {
     const match = profiles.find((profile) => profile.provider === provider);
@@ -3786,11 +3808,11 @@ async function handleMessage(bot, token, message) {
 
   const roots = getAllowedRoots(bot);
   let state = await readChatState(bot.id, chatId);
+  const stopTyping = startTypingLoop(token, chatId);
 
   try {
     let reply = "";
     let extra = {};
-    await telegram(token, "sendChatAction", { chat_id: chatId, action: "typing" }).catch(() => {});
 
     if (!text.startsWith("/") && state.capture && state.capture.targetPath) {
       state = await appendCaptureText(state, text);
@@ -3826,6 +3848,25 @@ async function handleMessage(bot, token, message) {
   } catch (error) {
     await appendRunnerLog(bot.id, `message error chat=${chatId} text=${JSON.stringify(text).slice(0, 400)} error=${error.stack || error.message || String(error)}`);
     await sendTelegramText(token, chatId, `Error: ${userFacingErrorMessage(error)}`);
+  } finally {
+    stopTyping();
+  }
+}
+
+async function warmLocalSupervisor(bot) {
+  try {
+    await generateText(
+      bot,
+      "Reply with exactly READY.",
+      "You are warming up the local Telegram supervisor model. Reply with exactly READY.",
+      {
+        profileId: "ollama:local",
+        model: bot.ollamaModel || "qwen2.5-coder:7b",
+        strict: true
+      }
+    );
+  } catch (error) {
+    await appendRunnerLog(bot.id, `local warmup failed: ${error.message || String(error)}`);
   }
 }
 
@@ -3867,6 +3908,10 @@ async function main() {
   bot.modelProvider = "ollama";
   bot.providerProfile = "local";
   bot.modelName = bot.ollamaModel;
+  await updateBotAiSettings(bot.id, {
+    aiProviderId: "ollama:local",
+    modelName: bot.ollamaModel
+  }).catch(() => {});
 
   const token = decryptSecret(bot.tokenEncrypted);
   const stateFile = path.join(STORAGE_DIR, `runner-state-${bot.id}.json`);
@@ -3890,6 +3935,7 @@ async function main() {
   );
 
   await processSchedules(bot, token).catch(() => {});
+  warmLocalSupervisor(bot).catch(() => {});
   setInterval(() => {
     processSchedules(bot, token).catch(async (error) => {
       await fsp.writeFile(
