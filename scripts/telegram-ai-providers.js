@@ -1,9 +1,20 @@
+const { execFile } = require("child_process");
+const fs = require("fs");
+const path = require("path");
+
 function ollamaBaseUrl(bot) {
   return String(bot.ollamaBaseUrl || process.env.OLLAMA_BASE_URL || "http://127.0.0.1:11434").replace(/\/+$/, "");
 }
 
 const OLLAMA_MODEL_KEEP_ALIVE = process.env.OLLAMA_KEEP_ALIVE || "8h";
 const OLLAMA_GENERATE_TIMEOUT_MS = Number(process.env.OLLAMA_GENERATE_TIMEOUT_MS || 300000);
+const OPENCLAW_COMMAND = process.platform === "win32" ? "openclaw.cmd" : "openclaw";
+const OPENCLAW_CONFIG_PATH = path.join(process.env.USERPROFILE || "", ".openclaw", "openclaw.json");
+const OPENCLAW_FALLBACK_MODELS = [
+  process.env.OPENCLAW_MODEL || "anthropic/claude-sonnet-4-20250514",
+  "anthropic/claude-sonnet-4-20250514",
+  "anthropic/claude-opus-4-6"
+].filter(Boolean);
 
 async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
   const controller = new AbortController();
@@ -16,6 +27,36 @@ async function fetchWithTimeout(url, options = {}, timeoutMs = 30000) {
   } finally {
     clearTimeout(timer);
   }
+}
+
+function execFileText(command, args, options = {}) {
+  return new Promise((resolve, reject) => {
+    execFile(command, args, {
+      windowsHide: true,
+      timeout: options.timeoutMs || 60000,
+      maxBuffer: 1024 * 1024,
+      ...options
+    }, (error, stdout, stderr) => {
+      if (error) {
+        reject(new Error((stderr || stdout || error.message || "").trim() || `Failed to run ${command}`));
+        return;
+      }
+      resolve(String(stdout || "").trim());
+    });
+  });
+}
+
+async function execOpenClawText(args, options = {}) {
+  if (process.platform !== "win32") {
+    return execFileText(OPENCLAW_COMMAND, args, options);
+  }
+
+  const serialized = args.map((arg) => `'${String(arg).replace(/'/g, "''")}'`).join(", ");
+  const script = [
+    `$cmd = ${`'${OPENCLAW_COMMAND.replace(/'/g, "''")}'`}`,
+    `& $cmd @(${serialized})`
+  ].join("; ");
+  return execFileText("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], options);
 }
 
 function configuredProfiles(bot) {
@@ -72,6 +113,14 @@ function configuredProfiles(bot) {
       profile: "default",
       label: "Anthropic Default",
       apiKey: process.env.ANTHROPIC_API_KEY || ""
+    },
+    {
+      id: "openclaw:local",
+      provider: "openclaw",
+      profile: "local",
+      label: "OpenClaw Gateway",
+      configured: Boolean(process.env.OPENCLAW_ENABLE === "1" || fs.existsSync(OPENCLAW_CONFIG_PATH)),
+      defaultModel: process.env.OPENCLAW_MODEL || "anthropic/claude-sonnet-4-20250514"
     }
   ];
 
@@ -87,10 +136,10 @@ function configuredProfiles(bot) {
   ];
 
   for (const profile of [...openAiProfiles, ...cohereProfiles, ...anthropicProfiles, ...openRouterProfiles]) {
-    if (profile.apiKey) {
+    if (profile.apiKey || profile.configured) {
       profiles.push({
         ...profile,
-        configured: true
+        configured: profile.configured !== false
       });
     }
   }
@@ -111,6 +160,9 @@ function preferredModelNames(provider) {
   }
   if (provider === "anthropic") {
     return ["claude-3-5-haiku-latest", "claude-3-7-sonnet-latest", "claude-sonnet-4-20250514"];
+  }
+  if (provider === "openclaw") {
+    return ["anthropic/claude-sonnet-4-20250514", "anthropic/claude-opus-4-6"];
   }
   if (provider === "openrouter") {
     return ["openrouter/auto", "anthropic/claude-3.5-haiku", "openai/gpt-4o-mini", "qwen/qwen-2.5-coder-32b-instruct"];
@@ -151,6 +203,7 @@ function findProfile(bot, rawValue) {
     profiles.find((profile) => token === "openai1" && profile.id === "openai:project1") ||
     profiles.find((profile) => token === "openai2" && profile.id === "openai:project2") ||
     profiles.find((profile) => token === "claude" && profile.provider === "anthropic") ||
+    profiles.find((profile) => token === "openclaw" && profile.provider === "openclaw") ||
     profiles.find((profile) => token === "openrouterauto" && profile.id === "openrouter:default") ||
     profiles.find((profile) => normalizeToken(profile.provider) === token) ||
     profiles.find((profile) => normalizeToken(`${profile.provider}${profile.profile}`) === token) ||
@@ -251,6 +304,21 @@ async function listModels(bot, override = {}) {
     return { selection, models };
   }
 
+  if (selection.provider === "openclaw") {
+    let models = [];
+    try {
+      const output = await execOpenClawText(["models", "status", "--plain"], { timeoutMs: 8000 });
+      models = output
+        .split(/\r?\n/)
+        .map((line) => line.trim())
+        .filter(Boolean);
+    } catch {
+      models = OPENCLAW_FALLBACK_MODELS.slice();
+    }
+    models = [...new Set(models.concat(OPENCLAW_FALLBACK_MODELS))];
+    return { selection, models };
+  }
+
   if (selection.provider === "openrouter") {
     const response = await fetchWithTimeout("https://openrouter.ai/api/v1/models", {
       method: "GET",
@@ -295,6 +363,40 @@ function extractOpenAiText(payload) {
       if (typeof part.text === "string" && part.text.trim()) {
         return part.text.trim();
       }
+    }
+  }
+  return "";
+}
+
+function extractOpenClawText(payload) {
+  if (!payload) {
+    return "";
+  }
+  if (typeof payload === "string") {
+    return payload.trim();
+  }
+  const payloads = Array.isArray(payload.payloads)
+    ? payload.payloads
+    : Array.isArray(payload.result?.payloads)
+      ? payload.result.payloads
+      : [];
+  for (const entry of payloads) {
+    if (typeof entry?.text === "string" && entry.text.trim()) {
+      return entry.text.trim();
+    }
+  }
+  const candidates = [
+    payload.text,
+    payload.response,
+    payload.message,
+    payload.output,
+    payload.result,
+    payload.reply && payload.reply.text,
+    payload.data && payload.data.text
+  ];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
     }
   }
   return "";
@@ -458,6 +560,39 @@ async function generateText(bot, prompt, systemPrompt, override = {}) {
       .trim();
     if (!response.ok || !text) {
       throw new Error(payload.error?.message || payload.message || "Anthropic request failed.");
+    }
+
+    return {
+      selection,
+      text
+    };
+  }
+
+  if (selection.provider === "openclaw") {
+    const rules = String(systemPrompt || bot.systemPrompt || "").trim();
+    const combinedPrompt = rules
+      ? `${prompt}\n\nFollow these output rules:\n${rules}`
+      : prompt;
+    const sessionId = override.sessionId || `telegram-${bot.id || bot.name || "bot"}`;
+    const raw = await execOpenClawText([
+      "agent",
+      "--json",
+      "--session-id",
+      sessionId,
+      "--thinking",
+      "off",
+      "--message",
+      combinedPrompt
+    ], { timeoutMs: 60000 });
+
+    let text = "";
+    try {
+      text = extractOpenClawText(JSON.parse(raw));
+    } catch {
+      text = raw.trim();
+    }
+    if (!text) {
+      throw new Error("OpenClaw request failed.");
     }
 
     return {

@@ -126,6 +126,17 @@ async function start(bot) {
   console.log(`Started Telegram runner for ${bot} (PID ${child.pid}).`);
 }
 
+async function ensure(bot) {
+  await ensureDirs();
+  const existing = await findRunnerProcesses(bot);
+  if (existing.length) {
+    await writePidFile(bot, existing[0].ProcessId);
+    console.log(`Runner already active for ${bot} (PID ${existing[0].ProcessId}).`);
+    return;
+  }
+  await start(bot);
+}
+
 async function stop(bot) {
   const existing = await findRunnerProcesses(bot);
   if (!existing.length) {
@@ -189,6 +200,10 @@ async function main() {
     await start(bot);
     return;
   }
+  if (action === "ensure") {
+    await ensure(bot);
+    return;
+  }
   if (action === "stop") {
     await stop(bot);
     return;
@@ -202,7 +217,7 @@ async function main() {
     return;
   }
 
-  console.log("Usage: node scripts/telegram-runner-control.js <start|stop|status|install-autostart> [bot]");
+  console.log("Usage: node scripts/telegram-runner-control.js <start|ensure|stop|status|install-autostart> [bot]");
   process.exitCode = 1;
 }
 

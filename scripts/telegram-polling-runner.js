@@ -8,6 +8,18 @@ const PDFDocument = require("pdfkit");
 const XLSX = require("xlsx");
 const mammoth = require("mammoth");
 const pdfParse = require("pdf-parse");
+const { navigateDesktopTarget } = require("./desktop-playwright");
+const {
+  closePlaywrightSession,
+  clickPlaywrightTarget,
+  listPlaywrightTabs,
+  openPlaywrightTarget,
+  pressPlaywrightKey,
+  screenshotPlaywrightPage,
+  selectPlaywrightTab,
+  snapshotPlaywrightPage,
+  typeIntoPlaywrightTarget
+} = require("./telegram-playwright-session");
 const {
   notionSearch,
   notionRetrievePage,
@@ -35,12 +47,15 @@ const STORAGE_DIR = path.join(ROOT, "storage", "telegram");
 const BOTS_FILE = path.join(STORAGE_DIR, "bots.json");
 const LOG_DIR = path.join(STORAGE_DIR, "logs");
 const CHAT_DIR = path.join(STORAGE_DIR, "chats");
+const PLAYWRIGHT_DIR = path.join(STORAGE_DIR, "playwright");
+const CALLBACK_ALIASES_FILE = path.join(STORAGE_DIR, "callback-aliases.json");
 const SCHEDULES_FILE = path.join(STORAGE_DIR, "schedules.json");
 const DEVICES_FILE = path.join(STORAGE_DIR, "devices.json");
 const AGENT_TASKS_FILE = path.join(STORAGE_DIR, "agent-tasks.json");
 const MEMORIES_FILE = path.join(STORAGE_DIR, "memories.json");
 const ACTIVE_AGENT_TASKS = new Set();
 const DEFAULT_TIMEOUT_MS = 20000;
+const ACTION_TIMEOUT_MS = 60000;
 const TELEGRAM_LIMIT = 3900;
 const MAX_HISTORY_MESSAGES = 10;
 const MAX_TOOL_ACTIONS = 3;
@@ -80,6 +95,7 @@ const CALLBACK_ALIASES = new Map();
 let TELEGRAM_SEND_MUTE_UNTIL = 0;
 
 loadEnvFile(path.join(ROOT, ".env.local"));
+loadCallbackAliases();
 
 function loadEnvFile(filePath) {
   if (!fs.existsSync(filePath)) {
@@ -101,6 +117,32 @@ function loadEnvFile(filePath) {
       process.env[key] = value;
     }
   }
+}
+
+function loadCallbackAliases() {
+  try {
+    if (!fs.existsSync(CALLBACK_ALIASES_FILE)) {
+      return;
+    }
+    const raw = fs.readFileSync(CALLBACK_ALIASES_FILE, "utf8");
+    const parsed = JSON.parse(raw);
+    const aliases = parsed && typeof parsed.aliases === "object" ? parsed.aliases : {};
+    for (const [key, value] of Object.entries(aliases)) {
+      if (key && value) {
+        CALLBACK_ALIASES.set(key, value);
+      }
+    }
+  } catch {}
+}
+
+function persistCallbackAliases() {
+  try {
+    fs.mkdirSync(STORAGE_DIR, { recursive: true });
+    const entries = Array.from(CALLBACK_ALIASES.entries()).slice(-500);
+    fs.writeFileSync(CALLBACK_ALIASES_FILE, JSON.stringify({
+      aliases: Object.fromEntries(entries)
+    }, null, 2), "utf8");
+  } catch {}
 }
 
 function requireEncryptionKey() {
@@ -249,9 +291,13 @@ function commandKeyboard() {
   return {
     keyboard: [
       [{ text: "/menu" }, { text: "/brief" }, { text: "/status" }],
-      [{ text: "/docs" }, { text: "/newdoc" }, { text: "/workon" }],
-      [{ text: "/autopilot" }, { text: "/squad" }, { text: "/tasks" }],
-      [{ text: "/providers" }, { text: "/models" }, { text: "/memories" }]
+      [{ text: "/showcase" }, { text: "/dashboard" }, { text: "/tasks" }],
+      [{ text: "/docs" }, { text: "/newdoc" }, { text: "/delete" }],
+      [{ text: "/browse" }, { text: "/launch" }, { text: "/workon" }],
+      [{ text: "/playwright" }, { text: "/pwtabs" }, { text: "/pwsnapshot" }],
+      [{ text: "/autopilot" }, { text: "/squad" }, { text: "/openclaw" }],
+      [{ text: "/providers" }, { text: "/openclaw" }, { text: "/models" }],
+      [{ text: "/memories" }]
     ],
     resize_keyboard: true,
     is_persistent: true
@@ -276,6 +322,7 @@ function encodeCallbackData(value) {
   }
   const alias = `act:${crypto.createHash("sha1").update(raw).digest("hex").slice(0, 16)}`;
   CALLBACK_ALIASES.set(alias, raw);
+  persistCallbackAliases();
   return alias;
 }
 
@@ -284,10 +331,147 @@ function resolveCallbackData(value) {
   return CALLBACK_ALIASES.get(raw) || raw;
 }
 
+function withActionTimeout(promise, message, timeoutMs = ACTION_TIMEOUT_MS) {
+  let timer = null;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(message)), timeoutMs);
+  });
+  return Promise.race([
+    Promise.resolve(promise).finally(() => {
+      if (timer) {
+        clearTimeout(timer);
+      }
+    }),
+    timeout
+  ]);
+}
+
+function backgroundJobId() {
+  return crypto.randomBytes(3).toString("hex");
+}
+
+function shouldDetachCommand(command, args = "") {
+  const normalizedArgs = String(args || "").trim();
+  if (
+    command === "health" ||
+    command === "brief" ||
+    command === "project" ||
+    command === "gendoc" ||
+    command === "showcaseweb" ||
+    command === "showcasedoc" ||
+    command === "showcaseapps" ||
+    command === "showcaseai" ||
+    command === "pwopen" ||
+    command === "pwtabs" ||
+    command === "pwsnapshot" ||
+    command === "pwscreenshot" ||
+    command === "pwclick" ||
+    command === "pwtype" ||
+    command === "pwpress" ||
+    command === "ask" ||
+    command === "ideas" ||
+    command === "brainstorm" ||
+    command === "planbuild" ||
+    command === "outline" ||
+    command === "analyze" ||
+    command === "summarize" ||
+    command === "casepack" ||
+    command === "html" ||
+    command === "component" ||
+    command === "route" ||
+    command === "spec" ||
+    command === "wix" ||
+    command === "wixcontacts" ||
+    command === "notionstatus" ||
+    command === "notionsearch" ||
+    command === "notionopen" ||
+    command === "notionpage" ||
+    command === "notionappend" ||
+    command === "notionappendto" ||
+    command === "notioncreate" ||
+    command === "notioncreatein" ||
+    command === "notionquery" ||
+    command === "notionusers" ||
+    command === "manus" ||
+    command === "manusnotion" ||
+    command === "manusstatus" ||
+    command === "manuslist" ||
+    command === "fetch" ||
+    command === "models"
+  ) {
+    return true;
+  }
+  if (command === "browse") {
+    return /^https?:\/\//i.test(normalizedArgs);
+  }
+  if (command === "openclaw") {
+    return !/^(use|on|switch)\b/i.test(normalizedArgs);
+  }
+  return false;
+}
+
+async function startDetachedCommand(bot, token, chatId, command, worker, options = {}) {
+  const jobId = backgroundJobId();
+  const replyCommand = options.replyCommand || command;
+  const label = options.label || `/${command}`;
+  const ackText = options.ackText || [
+    `${label} started in the background.`,
+    `Job: ${jobId}`,
+    "I’ll post the result here when it finishes."
+  ].join("\n");
+
+  setTimeout(() => {
+    Promise.resolve()
+      .then(worker)
+      .then(async (result) => {
+        const text =
+          typeof result === "string"
+            ? result
+            : result && typeof result.text === "string"
+              ? result.text
+              : `${label} finished.`;
+        const extra =
+          result && result.extra && typeof result.extra === "object"
+            ? result.extra
+            : replyMarkupForCommand(replyCommand);
+        await appendRunnerLog(bot.id, `background job finished command=${command} job=${jobId}`);
+        await sendTelegramText(
+          token,
+          chatId,
+          [`${label} finished`, `Job: ${jobId}`, "", text].join("\n"),
+          extra
+        ).catch(() => {});
+      })
+      .catch(async (error) => {
+        await appendRunnerLog(
+          bot.id,
+          `background job failed command=${command} job=${jobId} error=${error.stack || error.message || String(error)}`
+        );
+        await sendTelegramText(
+          token,
+          chatId,
+          [`${label} failed`, `Job: ${jobId}`, "", userFacingErrorMessage(error)].join("\n"),
+          replyMarkupForCommand(replyCommand)
+        ).catch(() => {});
+      });
+  }, 0);
+
+  await appendRunnerLog(bot.id, `background job started command=${command} job=${jobId}`);
+  return { text: ackText, extra: replyMarkupForCommand(replyCommand) };
+}
+
+async function maybeDetachCommand(bot, token, chatId, command, args, worker, options = {}) {
+  if (!chatId || !shouldDetachCommand(command, args)) {
+    return worker();
+  }
+  return startDetachedCommand(bot, token, chatId, command, worker, options);
+}
+
 function homeInlineKeyboard() {
   return inlineKeyboard([
     [{ text: "Status", data: "cmd:status" }, { text: "Health", data: "cmd:health" }],
     [{ text: "Files", data: "cmd:files" }, { text: "Project", data: "cmd:project" }],
+    [{ text: "Browse Desktop", data: "cmd:browse desktop" }, { text: "OpenClaw", data: "cmd:openclaw" }],
     [{ text: "Wix", data: "cmd:wix" }, { text: "Notion", data: "cmd:notionstatus" }],
     [{ text: "Workbench", data: "cmd:workbench" }, { text: "Manus", data: "cmd:manuslist" }],
     [{ text: "Network", data: "cmd:network" }, { text: "Mode Build", data: "cmd:mode build" }],
@@ -309,6 +493,7 @@ function projectInlineKeyboard() {
     [{ text: "Files", data: "cmd:files" }, { text: "Git Status", data: "cmd:gitstatus" }],
     [{ text: "Brief", data: "cmd:brief" }, { text: "Docs", data: "cmd:docs" }],
     [{ text: "Clipboard", data: "cmd:clipboard" }, { text: "Memories", data: "cmd:memories" }],
+    [{ text: "Playwright", data: "cmd:playwright" }, { text: "PW Snapshot", data: "cmd:pwsnapshot" }],
     [{ text: "Git Log", data: "cmd:gitlog" }, { text: "Find package", data: "cmd:find package" }],
     [{ text: "Tree", data: "cmd:tree" }, { text: "Workbench", data: "nav:build" }],
     [{ text: "Home", data: "nav:home" }]
@@ -352,20 +537,39 @@ function aiInlineKeyboard() {
   return inlineKeyboard([
     [{ text: "Providers", data: "cmd:providers" }, { text: "Models", data: "cmd:models" }],
     [{ text: "Use Ollama", data: "cmd:provider ollama" }, { text: "Use Cohere", data: "cmd:provider cohere" }],
-    [{ text: "Use Claude", data: "cmd:provider anthropic" }, { text: "Use OpenRouter", data: "cmd:provider openrouter" }],
-    [{ text: "Use OpenAI 1", data: "cmd:provider openai:project1" }, { text: "Reset Qwen", data: "cmd:modeluse ollama | qwen2.5-coder:7b" }],
+    [{ text: "Use Claude", data: "cmd:provider anthropic" }, { text: "Use OpenClaw", data: "cmd:provider openclaw" }],
+    [{ text: "Use OpenRouter", data: "cmd:provider openrouter" }, { text: "Use OpenAI 1", data: "cmd:provider openai:project1" }],
+    [{ text: "OpenClaw Status", data: "cmd:openclaw" }, { text: "Reset Qwen", data: "cmd:modeluse ollama | qwen2.5-coder:7b" }],
     [{ text: "Tasks", data: "nav:tasks" }, { text: "Home", data: "nav:dashboard" }]
+  ]);
+}
+
+function playwrightInlineKeyboard() {
+  return inlineKeyboard([
+    [{ text: "Playwright Help", data: "cmd:playwright" }, { text: "Open Zenai", data: "cmd:pwopen https://zenai.world" }],
+    [{ text: "PW Tabs", data: "cmd:pwtabs" }, { text: "PW Snapshot", data: "cmd:pwsnapshot" }],
+    [{ text: "PW Screenshot", data: "cmd:pwscreenshot" }, { text: "Close PW", data: "cmd:pwclose" }],
+    [{ text: "Files", data: "nav:files" }, { text: "Home", data: "nav:dashboard" }]
+  ]);
+}
+
+function showcaseInlineKeyboard() {
+  return inlineKeyboard([
+    [{ text: "Desktop Scan", data: "cmd:showcasedesktop" }, { text: "Live Web Demo", data: "cmd:showcaseweb" }],
+    [{ text: "Smart Doc", data: "cmd:showcasedoc" }, { text: "Site Agent", data: "cmd:showcasetask" }],
+    [{ text: "Apps Pulse", data: "cmd:showcaseapps" }, { text: "AI Flex", data: "cmd:showcaseai" }],
+    [{ text: "Playwright", data: "cmd:playwright" }, { text: "Home", data: "nav:dashboard" }]
   ]);
 }
 
 function tasksInlineKeyboard() {
   return inlineKeyboard([
     [{ text: "Task List", data: "cmd:tasks" }, { text: "Task Help", data: "cmd:agenthelp" }],
-    [{ text: "Doc Agent", data: "cmd:docagent desktop\\ZEN Intake\\sample.txt" }],
+    [{ text: "Doc Agent", data: "cmd:docagent" }],
     [{ text: "Claude", data: "cmd:provider anthropic" }, { text: "OpenRouter", data: "cmd:provider openrouter" }],
-    [{ text: "Autopilot", data: "cmd:autopilot doc | desktop\\ZEN Intake\\sample.txt" }],
-    [{ text: "Squad", data: "cmd:squad doc | desktop\\ZEN Intake\\sample.txt" }],
-    [{ text: "Sheet Agent", data: "cmd:sheetagent desktop\\sample.xlsx" }],
+    [{ text: "Autopilot", data: "cmd:autopilot site | wix | audit the current site and suggest the best improvements" }],
+    [{ text: "Squad", data: "cmd:squad site | wix | audit the current site and suggest the best improvements" }],
+    [{ text: "Sheet Agent", data: "cmd:sheetagent" }],
     [{ text: "Site Agent", data: "cmd:siteagent wix" }],
     [{ text: "Home", data: "nav:dashboard" }]
   ]);
@@ -407,6 +611,9 @@ function navigationScreen(bot, key) {
   if (key === "tasks") {
     return { text: "Agent tasks panel", extra: { reply_markup: tasksInlineKeyboard() } };
   }
+  if (key === "showcase") {
+    return { text: showcaseText(bot), extra: { reply_markup: showcaseInlineKeyboard() } };
+  }
   if (key === "schedules") {
     return { text: "Schedules panel", extra: { reply_markup: scheduleInlineKeyboard() } };
   }
@@ -421,11 +628,57 @@ function dashboardText(bot) {
     "Quickest phone flows:",
     "- /brief for a fast mobile status snapshot",
     "- /newdoc to create a document",
+    "- ask naturally to generate a short test doc with content",
+    "- /delete to send a file or folder to the Recycle Bin",
+    "- /browse to inspect the desktop or a file",
+    "- /playwright and /pwopen to control a live browser session",
     "- /workon to hand a document to the agent",
     "- /autopilot to let the bot choose the best provider",
     "- /squad to run a multi-model synthesis",
+    "- /openclaw to see or switch to the OpenClaw gateway",
+    "- /showcase for six polished demos you can trigger live",
     "",
-    "Use the panels below for documents, AI control, integrations, and scheduled work."
+    "Use the panels below for documents, AI control, integrations, and scheduled work. Ollama stays the cheap default unless you switch."
+  ].join("\n");
+}
+
+function workbenchText(bot) {
+  return [
+    `Build workbench for ${bot.name}`,
+    "",
+    "Use this when you want the bot to help make, improve, or plan something.",
+    "",
+    "Best first moves:",
+    "- New Doc: create a quick file in ZEN Docs",
+    "- Work Latest Doc: hand your newest document to the background agent",
+    "- Ideas: brainstorm what to build next",
+    "- Plan: turn an idea into an execution outline",
+    "- Doc Agent / Site Agent / Sheet Agent: specialized background workers",
+    "- Autopilot: let the bot choose the best available provider",
+    "",
+    "Simple examples:",
+    "- /workon",
+    "- /workon improve the latest doc and make it sharper",
+    "- /docagent",
+    "- /siteagent wix | audit the site and give me a practical roadmap",
+    "",
+    "If you are not sure, start with Work Latest Doc or Agent Help."
+  ].join("\n");
+}
+
+function showcaseText(bot) {
+  return [
+    `${bot.name} showcase mode`,
+    "",
+    "Six live demos you can trigger fast:",
+    "1. Desktop Scan: browse the desktop with Playwright",
+    "2. Live Web Demo: open zenai.world, inspect it, and grab a snapshot",
+    "3. Smart Doc: generate a polished markdown doc on demand",
+    "4. Site Agent: queue a background Wix/site audit and report back later",
+    "5. Apps Pulse: show connected integrations like Wix and Notion",
+    "6. AI Flex: show the active brains and OpenClaw status",
+    "",
+    "These are designed for live demo moments, not perfect workflow syntax."
   ].join("\n");
 }
 
@@ -434,6 +687,7 @@ function dashboardInlineKeyboard() {
     [{ text: "Control", data: "nav:control" }, { text: "Network", data: "nav:network" }],
     [{ text: "Devices", data: "nav:devices" }, { text: "Integrations", data: "nav:integrations" }],
     [{ text: "Files", data: "nav:files" }, { text: "Build", data: "nav:build" }],
+    [{ text: "Showcase", data: "nav:showcase" }],
     [{ text: "AI", data: "nav:ai" }, { text: "Tasks", data: "nav:tasks" }],
     [{ text: "Schedules", data: "nav:schedules" }]
   ]);
@@ -444,6 +698,8 @@ function controlInlineKeyboard() {
     [{ text: "Status", data: "cmd:status" }, { text: "Health", data: "cmd:health" }],
     [{ text: "Brief", data: "cmd:brief" }, { text: "Project", data: "cmd:project" }],
     [{ text: "Workbench", data: "cmd:workbench" }, { text: "Clipboard", data: "cmd:clipboard" }],
+    [{ text: "Browse Desktop", data: "cmd:browse desktop" }, { text: "OpenClaw", data: "cmd:openclaw" }],
+    [{ text: "Playwright", data: "cmd:playwright" }, { text: "PW Tabs", data: "cmd:pwtabs" }],
     [{ text: "Models", data: "cmd:models" }, { text: "Providers", data: "cmd:providers" }],
     [{ text: "Build Mode", data: "cmd:mode build" }, { text: "Tasks", data: "cmd:tasks" }],
     [{ text: "Home", data: "nav:dashboard" }]
@@ -473,13 +729,13 @@ function buildInlineKeyboard() {
     [{ text: "Brief", data: "cmd:brief" }, { text: "Memories", data: "cmd:memories" }],
     [{ text: "Ideas", data: "cmd:ideas app ideas for my repo" }, { text: "Plan", data: "cmd:planbuild polished dashboard" }],
     [{ text: "Outline", data: "cmd:outline launch-ready outline" }, { text: "Draft", data: "cmd:draft telegram-draft" }],
-    [{ text: "HTML", data: "cmd:html scratch\\prototype.html" }, { text: "Spec", data: "cmd:spec docs\\idea.md" }],
-    [{ text: "Start Intake", data: "cmd:intake dispute-case" }, { text: "Case Pack", data: "cmd:casepack desktop\\ZEN Intake\\sample.txt" }],
+    [{ text: "HTML", data: "cmd:html scratch\\prototype.html | build a polished landing page for ZEN AI with clear calls to action" }, { text: "Spec", data: "cmd:spec docs\\idea.md | draft a concise launch-ready product spec for the Telegram control center" }],
+    [{ text: "Start Intake", data: "cmd:intake dispute-case" }, { text: "Case Pack Help", data: "cmd:agenthelp" }],
     [{ text: "New Doc", data: "cmd:newdoc idea-note | created from Telegram" }, { text: "Docs", data: "cmd:docs" }],
-    [{ text: "Summarize", data: "cmd:summarize desktop\\ZEN Intake\\sample.txt" }, { text: "Work On Doc", data: "cmd:workon desktop\\ZEN Docs\\sample.md" }],
-    [{ text: "Doc Agent", data: "cmd:docagent desktop\\ZEN Intake\\sample.txt" }, { text: "Sheet Agent", data: "cmd:sheetagent desktop\\sample.xlsx" }],
+    [{ text: "Project Summary", data: "cmd:project" }, { text: "Work Latest Doc", data: "cmd:workon" }],
+    [{ text: "Doc Agent", data: "cmd:docagent" }, { text: "Sheet Agent", data: "cmd:sheetagent" }],
     [{ text: "Site Agent", data: "cmd:siteagent wix" }, { text: "Tasks", data: "nav:tasks" }],
-    [{ text: "Autopilot", data: "cmd:autopilot general | desktop\\ZEN Intake\\sample.txt" }, { text: "Squad", data: "cmd:squad general | desktop\\ZEN Intake\\sample.txt" }],
+    [{ text: "Autopilot", data: "cmd:autopilot site | wix | audit the current site and suggest the best improvements" }, { text: "Squad", data: "cmd:squad site | wix | audit the current site and suggest the best improvements" }],
     [{ text: "Desktop Files", data: "cmd:files desktop" }],
     [{ text: "Read Mode", data: "cmd:mode read" }, { text: "Home", data: "nav:dashboard" }]
   ]);
@@ -491,8 +747,12 @@ function replyMarkupForCommand(command, forceInline = false) {
       ? dashboardInlineKeyboard()
       : command === "workbench" || command === "mode" || command === "ideas" || command === "planbuild" || command === "html" || command === "component" || command === "route" || command === "spec" || command === "replace" || command === "zip" || command === "docagent" || command === "sheetagent" || command === "siteagent" || command === "agenttask" || command === "supervisor" || command === "delegate" || command === "autopilot" || command === "squad" || command === "capabilities" || command === "newdoc" || command === "workon"
         ? buildInlineKeyboard()
-      : command === "providers" || command === "provider" || command === "models" || command === "model" || command === "modeluse"
+      : command === "providers" || command === "provider" || command === "models" || command === "model" || command === "modeluse" || command === "openclaw"
         ? aiInlineKeyboard()
+      : command === "playwright" || command === "pwopen" || command === "pwtabs" || command === "pwtab" || command === "pwsnapshot" || command === "pwscreenshot" || command === "pwclick" || command === "pwtype" || command === "pwpress" || command === "pwclose"
+        ? playwrightInlineKeyboard()
+      : command === "showcase" || command === "showcasedesktop" || command === "showcaseweb" || command === "showcasedoc" || command === "showcasetask" || command === "showcaseapps" || command === "showcaseai"
+        ? showcaseInlineKeyboard()
       : command === "wix" || command === "wixcontacts"
       ? wixInlineKeyboard()
       : command === "notionstatus" || command === "notionsearch" || command === "notionopen" || command === "notionpage" || command === "notionappend" || command === "notionappendto" || command === "notioncreate" || command === "notioncreatein" || command === "notionquery" || command === "notionusers"
@@ -507,7 +767,7 @@ function replyMarkupForCommand(command, forceInline = false) {
         ? scheduleInlineKeyboard()
       : command === "network" || command === "wifi" || command === "ping" || command === "ports"
         ? networkInlineKeyboard()
-        : command === "files" || command === "docs" || command === "viewdoc" || command === "find" || command === "grep" || command === "gitstatus" || command === "gitlog" || command === "project" || command === "brief" || command === "clipboard" || command === "clipboardset" || command === "remember" || command === "memories" || command === "forget"
+        : command === "files" || command === "docs" || command === "viewdoc" || command === "find" || command === "grep" || command === "gitstatus" || command === "gitlog" || command === "project" || command === "brief" || command === "clipboard" || command === "clipboardset" || command === "remember" || command === "memories" || command === "forget" || command === "delete" || command === "browse" || command === "launch"
           ? projectInlineKeyboard()
           : defaultInlineKeyboard();
 
@@ -818,6 +1078,190 @@ function extractNaturalFolderPath(text) {
   return /\b(?:on|in)\s+(?:the\s+)?desktop\b/i.test(raw) ? `desktop\\${folderName}` : folderName;
 }
 
+function suggestDocTitleFromContent(text) {
+  const words = String(text || "")
+    .replace(/\b(?:on|in)\s+(?:the\s+)?desktop\b/ig, "")
+    .replace(/[^\p{L}\p{N}\s-]/gu, " ")
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 6);
+  return words.length ? words.join(" ") : "quick-note";
+}
+
+function extractGeneratedDocRequest(text) {
+  const raw = String(text || "").trim();
+  const lower = raw.toLowerCase();
+  if (!raw) {
+    return "";
+  }
+  if (!/^(?:please\s+)?(?:(?:can|could|will|would)\s+you\s+)?(?:generate|create|make|write|draft)\b/i.test(lower)) {
+    return "";
+  }
+  if (!/\b(doc(?:ument)?|note|draft|markdown|text\s+file|file)\b/i.test(lower)) {
+    return "";
+  }
+  if (/\b(summarize|summarizing|summary|analyse|analysing|analyze|analyzing|outline|brainstorm|brainstorming|plan|planning|research|researching|compare|comparing|rewrite|rewriting|revise|revising|improve|improving|expand|expanding)\b/i.test(lower)) {
+    return "";
+  }
+  if (/\b(with|containing|including|about|that says|saying|filled with|that has|has|include|link|url|quote)\b/i.test(lower) || /^(?:please\s+)?(?:(?:can|could|will|would)\s+you\s+)?generate\b/i.test(lower)) {
+    return raw;
+  }
+  return "";
+}
+
+function extractNaturalDocArgs(text) {
+  const raw = String(text || "").trim();
+  const lower = raw.toLowerCase();
+  if (!raw) {
+    return "";
+  }
+  if (!/^(?:please\s+)?(?:(?:can|could|will|would)\s+you\s+)?(?:create|make|new|write|draft)\b/i.test(lower)) {
+    return "";
+  }
+  if (!/\b(doc(?:ument)?|note|draft|markdown|text\s+file|file)\b/i.test(lower)) {
+    return "";
+  }
+  if (/\b(summarize|summarizing|summary|analyse|analysing|analyze|analyzing|outline|brainstorm|brainstorming|plan|planning|research|researching|compare|comparing|rewrite|rewriting|revise|revising|improve|improving|expand|expanding|generate|generating)\b/i.test(lower)) {
+    return "";
+  }
+
+  const contentMatch = raw.match(/\b(?:with|containing|including|about|that says|saying|filled with)\b[:\s-]*(.+)$/i);
+  const content = contentMatch && contentMatch[1] ? contentMatch[1].trim() : "";
+  const titleSource = contentMatch ? raw.slice(0, contentMatch.index).trim() : raw;
+
+  let title = extractNaturalDocTitle(titleSource);
+  if (!title || /^(?:document|doc|note|draft|quick-note)$/i.test(title)) {
+    title = content ? suggestDocTitleFromContent(content) : "";
+  }
+  title = title || "quick-note";
+
+  return content ? `${title} | ${content}` : title;
+}
+
+function isProbablyUrl(value) {
+  return /^https?:\/\//i.test(String(value || "").trim());
+}
+
+function looksLikeLocalPath(value) {
+  const source = String(value || "").trim();
+  if (!source) {
+    return false;
+  }
+  return (
+    /^[a-z]:[\\/]/i.test(source) ||
+    /^desktop[\\/]/i.test(source) ||
+    /^documents?[\\/]/i.test(source) ||
+    /^[.]{1,2}[\\/]/.test(source) ||
+    /[\\/]/.test(source) ||
+    /\.[a-z0-9]{1,8}$/i.test(source)
+  );
+}
+
+function looksLikeResolvableLocalPath(value) {
+  const source = String(value || "").trim();
+  if (!source) {
+    return false;
+  }
+  if (/^https?:\/\//i.test(source)) {
+    return false;
+  }
+  if (/^wix$/i.test(source)) {
+    return false;
+  }
+  if (/^[a-z]:[\\/]/i.test(source) || /^desktop[\\/]/i.test(source) || /^documents?[\\/]/i.test(source) || /^[.]{1,2}[\\/]/.test(source)) {
+    return true;
+  }
+  if (/[\\/]/.test(source)) {
+    return true;
+  }
+  if (/\.(txt|md|markdown|docx|pdf|csv|tsv|xlsx|xls|json|html?|ps1|js|ts|tsx|jsx)$/i.test(source)) {
+    return true;
+  }
+  return false;
+}
+
+function inferTaskTypeFromTarget(target) {
+  const value = String(target || "").trim().toLowerCase();
+  if (!value) {
+    return "general";
+  }
+  if (value === "wix" || /^https?:\/\//.test(value) || /\b(site|website|landing page|home page|app)\b/.test(value)) {
+    return "site";
+  }
+  if (/\.(xlsx|xls|csv|tsv)\b/.test(value) || /\b(sheet|spreadsheet|csv)\b/.test(value)) {
+    return "sheet";
+  }
+  if (/\.(txt|md|markdown|docx|pdf)\b/.test(value) || /\b(doc|document|note|brief|draft|file)\b/.test(value)) {
+    return "doc";
+  }
+  return "general";
+}
+
+function extractAutonomousTaskIntent(text) {
+  const raw = String(text || "").trim();
+  const lower = raw.toLowerCase();
+  if (!raw) {
+    return null;
+  }
+  const backgroundHint = /\b(background|autonomously|on your own|while i(?:'m| am)? busy|while i'm doing other things|get back to me|report back|let me know when|work on it|handle it)\b/i.test(raw);
+  const actionMatch = raw.match(/^(?:please\s+)?(?:(?:can|could|will|would)\s+you\s+)?(?:look into|research|analyze|audit|investigate|work on|handle|take care of|figure out|review|check)\s+(.+)$/i);
+  if (!backgroundHint && !actionMatch) {
+    return null;
+  }
+  const body = (actionMatch ? actionMatch[1] : raw)
+    .replace(/\b(?:and\s+(?:get back to me|report back|let me know(?: when it's done)?|work on it in the background))\b.*$/i, "")
+    .trim();
+  if (!body) {
+    return null;
+  }
+  let target = body;
+  let objective = "Create a practical work pack and report back here when the work is finished.";
+  const split = body.split(/\s+\|\s+/);
+  if (split.length > 1) {
+    target = split[0].trim();
+    objective = split.slice(1).join(" | ").trim() || objective;
+  }
+  const type = inferTaskTypeFromTarget(target);
+  return {
+    command: "autopilot",
+    args: `${type} | ${target} | ${objective}`
+  };
+}
+
+function powerShellLiteral(value) {
+  return `'${String(value || "").replace(/'/g, "''")}'`;
+}
+
+function extractExplicitPaths(text) {
+  const source = String(text || "");
+  const results = [];
+  const seen = new Set();
+
+  const push = (candidate) => {
+    const normalized = String(candidate || "").trim().replace(/^["“”']+|["“”']+$/g, "").replace(/[;,]+$/g, "").trim();
+    if (!normalized || !looksLikeLocalPath(normalized)) {
+      return;
+    }
+    const key = normalized.toLowerCase();
+    if (seen.has(key)) {
+      return;
+    }
+    seen.add(key);
+    results.push(normalized);
+  };
+
+  for (const match of source.matchAll(/["“]([^"\r\n]+)["”]/g)) {
+    push(match[1]);
+  }
+
+  for (const line of source.split(/\r?\n/)) {
+    const cleaned = line.replace(/^[\s>*-]+/, "").trim();
+    push(cleaned);
+  }
+
+  return results;
+}
+
 function parseQuickIntent(text) {
   const value = String(text || "").trim();
   const lower = value.toLowerCase();
@@ -827,11 +1271,35 @@ function parseQuickIntent(text) {
   if (/^(help|menu|start)\b/.test(lower)) {
     return { command: "menu", args: "" };
   }
+  if (/^(workbench|build panel|build tools|build mode help)\b/.test(lower) || /\bwhat does workbench do\b/.test(lower)) {
+    return { command: "workbench", args: "" };
+  }
+  if (/^(showcase|demo|show\s+me\s+something\s+cool|wow\s+me)\b/.test(lower)) {
+    return { command: "showcase", args: "" };
+  }
   if (/^(status|health|capabilities)\b/.test(lower)) {
     return { command: lower.split(/\s+/)[0], args: "" };
   }
   if (/^(docs|documents)\b/.test(lower)) {
     return { command: "docs", args: "" };
+  }
+  if (/^(?:use|switch(?:\s+to)?|set)\s+(?:back\s+to\s+)?(?:local\s+qwen|qwen|ollama)\b/.test(lower)) {
+    return { command: "provider", args: "ollama" };
+  }
+  if (/^(?:use|switch(?:\s+to)?|set)\s+(?:back\s+to\s+)?(?:openclaw)\b/.test(lower)) {
+    return { command: "provider", args: "openclaw" };
+  }
+  if (/^(?:use|switch(?:\s+to)?|set)\s+(?:back\s+to\s+)?(?:claude|anthropic)\b/.test(lower)) {
+    return { command: "provider", args: "anthropic" };
+  }
+  if (/^(?:use|switch(?:\s+to)?|set)\s+(?:back\s+to\s+)?(?:openrouter)\b/.test(lower)) {
+    return { command: "provider", args: "openrouter" };
+  }
+  if (/^(?:use|switch(?:\s+to)?|set)\s+(?:back\s+to\s+)?(?:openai)\b/.test(lower)) {
+    return { command: "provider", args: "openai:project1" };
+  }
+  if (/\b(?:what|which)\s+(?:provider|model)\b/.test(lower) && /\b(?:using|active|current|right now)\b/.test(lower)) {
+    return { command: "providers", args: "" };
   }
   if (/^(?:show|list|open|what(?:'s| is)\s+on)\s+(?:my\s+)?desktop\b/.test(lower) || /^desktop\b/.test(lower)) {
     return { command: "files", args: "desktop" };
@@ -845,12 +1313,102 @@ function parseQuickIntent(text) {
       return { command: "clipboardset", args: content };
     }
   }
+  const autonomousTaskIntent = extractAutonomousTaskIntent(value);
+  if (autonomousTaskIntent) {
+    return autonomousTaskIntent;
+  }
+  if (/^(?:playwright|browser)\s+(?:help|status)\b/.test(lower) || /^(?:how do i use|use)\s+playwright\b/.test(lower)) {
+    return { command: "playwright", args: "" };
+  }
+  if (/\b(?:playwright|browser)\b/i.test(value) && /\b(?:tabs?|windows?)\b/i.test(value)) {
+    const tabMatch = value.match(/\b(?:tab|tabs?)\s+(\d+)\b/i);
+    if (tabMatch) {
+      return { command: "pwtab", args: tabMatch[1] };
+    }
+    return { command: "pwtabs", args: "" };
+  }
+  if ((/\b(playwright|browser)\b/i.test(value) || /^open\b/i.test(lower)) && /https?:\/\//i.test(value)) {
+    const urlMatch = value.match(/https?:\/\/\S+/i);
+    if (urlMatch) {
+      return { command: "pwopen", args: urlMatch[0].replace(/[)>.,]+$/g, "") };
+    }
+  }
+  if (/^(?:use\s+)?playwright\s+to\s+open\b/i.test(lower)) {
+    const target = value.replace(/^(?:please\s+)?(?:(?:can|could|will|would)\s+you\s+)?(?:use\s+)?playwright\s+to\s+open\b[:\s-]*/i, "").trim();
+    if (target) {
+      return { command: "pwopen", args: target };
+    }
+  }
+  if (/\b(?:playwright|browser)\b/i.test(value) && /\b(?:snapshot|inspect|what(?:'s| is)\s+on\s+(?:the\s+)?page)\b/i.test(value)) {
+    return { command: "pwsnapshot", args: "" };
+  }
+  if (/\b(?:playwright|browser)\b/i.test(value) && /\b(?:screenshot|screen\s*shot|capture)\b/i.test(value)) {
+    return { command: "pwscreenshot", args: "" };
+  }
+  if (/^(?:close|reset)\s+(?:playwright|browser)\b/.test(lower)) {
+    return { command: "pwclose", args: "" };
+  }
+  if (/\b(?:playwright|browser)\b/i.test(value) && /\bpress\b/i.test(value)) {
+    const pressMatch = value.match(/\bpress\s+([a-z0-9_+-]+)\b/i);
+    if (pressMatch) {
+      return { command: "pwpress", args: pressMatch[1] };
+    }
+  }
+  const typeIntoMatch = value.match(/^(?:use\s+playwright\s+to\s+)?type\s+(.+?)\s+into\s+(.+)$/i);
+  if (typeIntoMatch) {
+    return { command: "pwtype", args: `${typeIntoMatch[2].trim()} | ${typeIntoMatch[1].trim()}` };
+  }
+  const clickMatch = value.match(/^(?:use\s+playwright\s+to\s+)?click\s+(.+)$/i);
+  if (clickMatch && /\b(playwright|browser|page|tab)\b/i.test(value)) {
+    return { command: "pwclick", args: clickMatch[1].trim() };
+  }
+  if ((/^(?:browse|navigate|inspect|open)\b/.test(lower) || /\buse\s+playwright\s+to\s+(?:browse|navigate|inspect|open)\b/i.test(value)) && /\b(desktop|folder|file|document|url|website|page|repo|project)\b/i.test(value)) {
+    const target = value
+      .replace(/^(?:please\s+)?(?:(?:can|could|will|would)\s+you\s+)?(?:use\s+)?(?:playwright\s+to\s+)?(?:browse|navigate|open|inspect)\b[:\s-]*/i, "")
+      .replace(/\busing\s+playwright\b/ig, "")
+      .trim();
+    return { command: "browse", args: target || "desktop" };
+  }
+  if (/^(?:launch|start|open)\b/i.test(lower) && /\b(app|application|program)\b/i.test(lower)) {
+    const target = value
+      .replace(/^(?:please\s+)?(?:(?:can|could|will|would)\s+you\s+)?(?:launch|start|open)\s+(?:the\s+)?(?:app|application|program)\b[:\s-]*/i, "")
+      .trim();
+    if (target) {
+      return { command: "launch", args: target };
+    }
+  }
+  if (/^(?:delete|remove|trash)\b/i.test(lower) && /\b(file|folder|directory|document|doc|path)\b/i.test(lower)) {
+    const target = value
+      .replace(/^(?:please\s+)?(?:(?:can|could|will|would)\s+you\s+)?(?:delete|remove|trash)\s+(?:the\s+)?(?:file|folder|directory|document|doc|path)\b[:\s-]*/i, "")
+      .trim();
+    if (target) {
+      return { command: "delete", args: target };
+    }
+  }
+  if (/^(?:delete|remove|trash)\b/i.test(lower)) {
+    const target = value
+      .replace(/^(?:please\s+)?(?:(?:can|could|will|would)\s+you\s+)?(?:delete|remove|trash)\b[:\s-]*/i, "")
+      .trim();
+    if (looksLikeLocalPath(target)) {
+      return { command: "delete", args: target };
+    }
+  }
+  if (/\b(?:delete|remove|trash)\b/i.test(lower)) {
+    const paths = extractExplicitPaths(value);
+    if (paths.length) {
+      return { command: "delete", args: paths.join("\n") };
+    }
+  }
+  const generatedDocRequest = extractGeneratedDocRequest(value);
+  if (generatedDocRequest) {
+    return { command: "gendoc", args: generatedDocRequest };
+  }
+  const naturalDocArgs = extractNaturalDocArgs(value);
+  if (naturalDocArgs) {
+    return { command: "newdoc", args: naturalDocArgs };
+  }
   if (/^(new\s+doc|new\s+dock|new\s+document|create\s+doc|create\s+document)\b/.test(lower)) {
     const title = value.replace(/^(new\s+doc|new\s+dock|new\s+document|create\s+doc|create\s+document)\b[:\s-]*/i, "").trim();
-    return { command: "newdoc", args: title || "quick-note" };
-  }
-  if (/^(?:please\s+)?(?:(?:can|could|will|would)\s+you\s+)?(?:create|make|new|write|draft)\b/i.test(lower) && /\b(doc(?:ument)?|note|draft|markdown|text\s+file|file)\b/i.test(lower)) {
-    const title = extractNaturalDocTitle(value);
     return { command: "newdoc", args: title || "quick-note" };
   }
   if (/^(?:please\s+)?(?:(?:can|could|will|would)\s+you\s+)?(?:create|make|new)\b/i.test(lower) && /\b(folder|directory)\b/i.test(lower)) {
@@ -900,8 +1458,8 @@ function conversationalQuickReply(bot, text, roots, state) {
     return [
       `Hi. I'm ${bot.displayName || bot.name}, running locally on this laptop.`,
       `Default brain: qwen2.5-coder on Ollama (${bot.ollamaModel || "qwen2.5-coder:7b"}).`,
-      `I can chat naturally, work with files, inspect the repo, use Wix/Notion/Manus, and delegate to your other AI providers when needed.`,
-      `Try: "summarize my project", "create a draft note", or "/dashboard".`
+      `I can chat naturally, work with files, inspect the repo, browse desktop folders/files with Playwright, use Wix/Notion/Manus, and delegate to your other AI providers when needed.`,
+      `Try: "summarize my project", "create a draft note", "browse desktop", or "/dashboard".`
     ].join("\n");
   }
 
@@ -926,8 +1484,8 @@ function conversationalQuickReply(bot, text, roots, state) {
   if (/\b(files|folders|desktop|documents|repo|project|laptop|apps|notion|wix|manus|providers|models)\b/.test(lower) && /\b(what|which|can you|do you|access|see|use)\b/.test(lower)) {
     return [
       `I can work inside my allowed roots on this laptop, including the project workspace and Desktop-based document folders.`,
-      `I can inspect files, create docs, summarize projects, and use connected integrations like Wix, Notion, and Manus when configured.`,
-      `If you want, ask naturally like "show me what files you can work with" or use "/roots", "/docs", "/project", or "/capabilities".`
+      `I can inspect files, create docs, browse folders and pages with Playwright, launch desktop targets honestly, summarize projects, and use connected integrations like Wix, Notion, and Manus when configured.`,
+      `If you want, ask naturally like "show me what files you can work with" or use "/roots", "/docs", "/browse", "/project", or "/capabilities".`
     ].join("\n");
   }
 
@@ -1083,6 +1641,59 @@ async function moveCommand(args, roots) {
   await fsp.mkdir(path.dirname(target), { recursive: true });
   await fsp.rename(source, target);
   return `Moved ${source} to ${target}`;
+}
+
+async function deletePathCommand(args, roots) {
+  const rawTarget = String(args || "").trim();
+  if (!rawTarget) {
+    throw new Error("Use /delete path");
+  }
+  const requestedTargets = extractExplicitPaths(rawTarget);
+  const candidates = requestedTargets.length ? requestedTargets : [rawTarget];
+  const resolvedTargets = [...new Set(candidates.map((candidate) => resolveAllowedPath(candidate, roots)))];
+
+  const outcomes = [];
+  for (const target of resolvedTargets) {
+    if (!fs.existsSync(target)) {
+      outcomes.push({ target, status: "missing" });
+      continue;
+    }
+
+    const script = [
+      "Add-Type -AssemblyName Microsoft.VisualBasic",
+      `$target = ${powerShellLiteral(target)}`,
+      "if (-not (Test-Path -LiteralPath $target)) { throw 'Target not found.' }",
+      "$item = Get-Item -LiteralPath $target",
+      "if ($item.PSIsContainer) {",
+      "  [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteDirectory($target, [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs, [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin)",
+      "} else {",
+      "  [Microsoft.VisualBasic.FileIO.FileSystem]::DeleteFile($target, [Microsoft.VisualBasic.FileIO.UIOption]::OnlyErrorDialogs, [Microsoft.VisualBasic.FileIO.RecycleOption]::SendToRecycleBin)",
+      "}",
+      "Write-Output 'OK'"
+    ].join("; ");
+    const result = await shellExec(script, roots[0]);
+    if (result.error) {
+      outcomes.push({ target, status: "error", detail: result.stderr || result.stdout || result.error.message || "delete failed" });
+      continue;
+    }
+    outcomes.push({ target, status: fs.existsSync(target) ? "failed" : "recycled" });
+  }
+
+  const recycled = outcomes.filter((entry) => entry.status === "recycled");
+  const missing = outcomes.filter((entry) => entry.status === "missing");
+  const failed = outcomes.filter((entry) => entry.status === "failed" || entry.status === "error");
+  if (!recycled.length && failed.length) {
+    throw new Error(failed.map((entry) => `${entry.target}: ${entry.detail || entry.status}`).join("\n"));
+  }
+
+  return [
+    recycled.length ? `Sent to Recycle Bin (${recycled.length})` : "Nothing was deleted.",
+    ...recycled.map((entry) => entry.target),
+    missing.length ? "" : null,
+    ...missing.map((entry) => `Missing: ${entry.target}`),
+    failed.length ? "" : null,
+    ...failed.map((entry) => `Failed: ${entry.target}${entry.detail ? ` | ${entry.detail}` : ""}`)
+  ].filter((line) => line !== null).join("\n");
 }
 
 async function runCommand(args, roots) {
@@ -1585,10 +2196,13 @@ async function mobileBrief(bot, chatId, roots) {
     ...(docs.length ? docs.map((item) => `- ${item.name}`) : ["- none yet"]),
     "",
     "Best quick actions",
-    "- /newdoc title | content",
+    "- /newdoc or /newdoc title | content",
+    "- ask naturally: generate a short test doc with a quote and link",
+    "- /browse desktop",
+    "- /delete desktop\\path\\file.md",
     "- /workon path | objective",
     "- /clipboard and /clipboardset text",
-    "- /remember title | note"
+    "- /openclaw and /remember title | note"
   ].join("\n"));
 }
 
@@ -1952,6 +2566,38 @@ function providersSummary(bot) {
   ].join("\n");
 }
 
+async function openClawStatusCommand() {
+  const openClawConfigPath = path.join(process.env.USERPROFILE || "", ".openclaw", "openclaw.json");
+  let configuredModel = "unknown";
+  try {
+    const rawConfig = await fsp.readFile(openClawConfigPath, "utf8");
+    const parsed = JSON.parse(rawConfig);
+    configuredModel = parsed?.agents?.defaults?.model?.primary || configuredModel;
+  } catch {}
+
+  const result = await shellExec("openclaw models status --plain", ROOT);
+  if (result.error && !result.stdout) {
+    return [
+      "OpenClaw status",
+      "Installed: yes",
+      `Gateway default: ${configuredModel}`,
+      "Reported active model: unavailable from CLI right now",
+      "Cost guardrail: Ollama stays the default. OpenClaw is opt-in, and its gateway is set to a cheaper Sonnet-class default with Opus kept as fallback.",
+      "Use /provider openclaw only when you want the OpenClaw tool stack."
+    ].join("\n");
+  }
+
+  const model = (result.stdout || "").split(/\r?\n/).map((line) => line.trim()).filter(Boolean)[0] || "unknown";
+  return [
+    "OpenClaw status",
+    `Installed: yes`,
+    `Gateway default: ${configuredModel}`,
+    `Reported active model: ${model}`,
+    "Cost guardrail: Ollama stays the default. OpenClaw is opt-in, and its gateway is set to a cheaper Sonnet-class default with Opus kept as fallback.",
+    "Use /provider openclaw or just say 'use openclaw' when you want the OpenClaw tool stack."
+  ].join("\n");
+}
+
 function fallbackSelectionChain(bot, currentId = "") {
   const profiles = configuredProviderProfiles(bot);
   const preferred = ["anthropic", "openrouter", "openai", "cohere", "ollama"];
@@ -2001,7 +2647,7 @@ function shouldUsePlanner(userText) {
   if (/^\/\w+/.test(text)) {
     return false;
   }
-  if (/[\\/]/.test(text) || /\b(path|file|folder|directory|repo|git|wix|notion|manus|network|wifi|port|ping|schedule|model|provider|task|tasks|document|doc|sheet|code|run|build|create|write|append|read|find|grep|move|copy|zip|analyze|intake|casepack|autopilot|squad|delegate|supervisor)\b/i.test(lower)) {
+  if (/[\\/]/.test(text) || /\b(path|file|folder|directory|desktop|app|apps|window|repo|git|wix|notion|manus|network|wifi|port|ping|schedule|model|provider|task|tasks|document|doc|sheet|code|run|build|create|write|append|read|find|grep|move|copy|delete|remove|trash|zip|analyze|intake|casepack|autopilot|squad|delegate|supervisor|playwright|browse|navigate|launch|openclaw)\b/i.test(lower)) {
     return true;
   }
   if (text.length > 280) {
@@ -2090,6 +2736,14 @@ async function generateArtifact(bot, prompt, systemPrompt, overrideSelection) {
   return String(output || "").replace(/^```[a-zA-Z]*\s*/g, "").replace(/```$/g, "").trim();
 }
 
+function cleanGeneratedDocumentBody(text) {
+  return String(text || "")
+    .replace(/^sure[!. ,:'"-]*here(?:'s| is)\s+your\s+.*?:\s*/i, "")
+    .replace(/^here(?:'s| is)\s+your\s+.*?:\s*/i, "")
+    .replace(/^below\s+is\s+your\s+.*?:\s*/i, "")
+    .trim();
+}
+
 async function writeGeneratedArtifact(bot, roots, args, systemPrompt, promptLabel) {
   const [rawPath, ...rest] = String(args || "").split("|");
   const targetPath = String(rawPath || "").trim();
@@ -2145,16 +2799,360 @@ async function createDocumentCommand(args, roots) {
   const [rawTitle, ...rest] = String(args || "").split("|");
   const title = String(rawTitle || "").trim();
   const content = rest.join("|").trim();
-  if (!title) {
-    throw new Error("Use /newdoc title | optional content");
-  }
-  const target = defaultDesktopDocPath(roots, title);
+  const resolvedTitle = title || "quick-note";
+  const target = defaultDesktopDocPath(roots, resolvedTitle);
   await fsp.mkdir(path.dirname(target), { recursive: true });
   const body = content
-    ? `# ${title}\n\n${content}\n`
-    : `# ${title}\n\nCreated from Telegram on ${new Date().toLocaleString()}.\n`;
+    ? `# ${resolvedTitle}\n\n${content}\n`
+    : `# ${resolvedTitle}\n\nCreated from Telegram on ${new Date().toLocaleString()}.\n`;
   await fsp.writeFile(target, body, "utf8");
   return `Created document\n${target}`;
+}
+
+async function generateDocumentCommand(bot, prompt, roots) {
+  const request = String(prompt || "").trim();
+  if (!request) {
+    throw new Error("Use a document request like: generate a test doc with a quote and a link");
+  }
+
+  const titleSeed = extractNaturalDocTitle(request);
+  const title = titleSeed && !/^(?:generate|create|make|write|draft)$/i.test(titleSeed)
+    ? titleSeed
+    : suggestDocTitleFromContent(request);
+  const profile = fastChatProfile(bot);
+  const content = await generateArtifact(
+    bot,
+    [
+      "Create a short markdown document for this request.",
+      "Keep it concise and polished.",
+      "If the user asks for a link, preserve the exact URL verbatim.",
+      "If the user asks for a quote, include one cool quote.",
+      "Return only markdown body content, with no code fences.",
+      "",
+      `User request: ${request}`
+    ].join("\n"),
+    "You write short polished markdown notes for Telegram-triggered document generation.",
+    profile ? { profileId: profile.id } : undefined
+  );
+
+  return createDocumentCommand(`${title || "quick-note"} | ${cleanGeneratedDocumentBody(content)}`, roots);
+}
+
+async function desktopBrowseCommand(args, roots) {
+  const requested = String(args || "").trim() || "desktop";
+  const target = isProbablyUrl(requested) ? requested : resolveAllowedPath(requested, roots);
+  const snapshot = await navigateDesktopTarget({
+    target,
+    outputDir: PLAYWRIGHT_DIR,
+    headless: true
+  });
+
+  const lines = [
+    "Playwright desktop navigator",
+    `Opened: ${snapshot.sourcePath}`,
+    `Kind: ${snapshot.kind}`,
+    snapshot.title ? `Title: ${snapshot.title}` : "",
+    snapshot.renderedPath ? `Rendered view: ${snapshot.renderedPath}` : "",
+    `Screenshot: ${snapshot.screenshotPath}`
+  ].filter(Boolean);
+
+  if (Array.isArray(snapshot.entries) && snapshot.entries.length) {
+    lines.push("");
+    lines.push("Visible entries:");
+    lines.push(...snapshot.entries.slice(0, 12).map((entry) => `- [${entry.kind}] ${entry.fullPath}`));
+  } else if (snapshot.bodyText) {
+    lines.push("");
+    lines.push("Visible text:");
+    lines.push(snapshot.bodyText);
+  }
+
+  return truncateForTelegram(lines.join("\n"));
+}
+
+function normalizePlaywrightOpenTarget(args, roots) {
+  const requested = String(args || "").trim();
+  if (!requested) {
+    throw new Error("Use /pwopen url-or-path");
+  }
+  if (isProbablyUrl(requested)) {
+    return requested;
+  }
+  return resolveAllowedPath(requested, roots);
+}
+
+function formatPlaywrightTabs(tabs) {
+  if (!Array.isArray(tabs) || !tabs.length) {
+    return [
+      "Playwright browser session",
+      "No tabs are open yet.",
+      "Use /pwopen https://example.com or say 'use playwright to open https://example.com'."
+    ].join("\n");
+  }
+  return [
+    "Playwright browser tabs",
+    "",
+    ...tabs.map((tab) => `${tab.active ? "*" : "-"} [${tab.index}] ${tab.title || "(untitled)"} | ${tab.url || "about:blank"}`)
+  ].join("\n");
+}
+
+function formatPlaywrightSnapshot(snapshot) {
+  const lines = [
+    "Playwright page snapshot",
+    `Title: ${snapshot.title || "(untitled)"}`,
+    `URL: ${snapshot.url || "about:blank"}`
+  ];
+  if (snapshot.bodyText) {
+    lines.push("");
+    lines.push("Visible text:");
+    lines.push(snapshot.bodyText);
+  }
+  if (Array.isArray(snapshot.interactive) && snapshot.interactive.length) {
+    lines.push("");
+    lines.push("Interactive elements:");
+    lines.push(...snapshot.interactive.slice(0, 12).map((item, index) => {
+      const detail = [item.text, item.id && `#${item.id}`, item.name && `name=${item.name}`, item.type && `type=${item.type}`].filter(Boolean).join(" | ");
+      return `- ${index + 1}. ${item.tag}${detail ? ` | ${detail}` : ""}`;
+    }));
+  }
+  return truncateForTelegram(lines.join("\n"));
+}
+
+async function playwrightHelpCommand() {
+  let tabs = [];
+  try {
+    tabs = await listPlaywrightTabs();
+  } catch {}
+  return truncateForTelegram([
+    formatPlaywrightTabs(tabs),
+    "",
+    "Useful Playwright controls",
+    "/pwopen https://zenai.world",
+    "/pwopen desktop\\ZEN Docs\\file.md",
+    "/pwtabs",
+    "/pwtab 0",
+    "/pwsnapshot",
+    "/pwscreenshot",
+    "/pwclick Sign in",
+    "/pwtype Search | zenai world",
+    "/pwpress Enter",
+    "/pwclose",
+    "",
+    "Natural language also works: 'use playwright to open https://example.com', 'show playwright tabs', 'take a playwright screenshot'.",
+    "Scope: this controls the bot's Playwright browser session. Desktop app launch is still done with /launch."
+  ].join("\n"));
+}
+
+async function playwrightOpenCommand(args, roots) {
+  const target = normalizePlaywrightOpenTarget(args, roots);
+  const opened = await openPlaywrightTarget(target);
+  return [
+    "Opened in Playwright",
+    `URL: ${opened.url || target}`,
+    opened.title ? `Title: ${opened.title}` : "",
+    `Tabs: ${opened.tabCount || 1}`,
+    "Use /pwsnapshot to inspect the page or /pwscreenshot to capture it."
+  ].filter(Boolean).join("\n");
+}
+
+async function playwrightTabsCommand() {
+  return truncateForTelegram(formatPlaywrightTabs(await listPlaywrightTabs()));
+}
+
+async function playwrightTabCommand(args) {
+  const index = String(args || "").trim();
+  if (!index) {
+    throw new Error("Use /pwtab index");
+  }
+  const selected = await selectPlaywrightTab(index);
+  return [
+    "Playwright tab selected",
+    `Index: ${selected.index}`,
+    `Title: ${selected.title || "(untitled)"}`,
+    `URL: ${selected.url || "about:blank"}`
+  ].join("\n");
+}
+
+async function playwrightSnapshotCommand() {
+  return formatPlaywrightSnapshot(await snapshotPlaywrightPage());
+}
+
+async function playwrightScreenshotCommand(token, chatId) {
+  const imagePath = await screenshotPlaywrightPage();
+  await sendTelegramDocument(token, chatId, imagePath, `Playwright screenshot ${path.basename(imagePath)}`);
+  return `Captured a Playwright screenshot\n${imagePath}`;
+}
+
+async function playwrightClickCommand(args) {
+  const target = String(args || "").trim();
+  if (!target) {
+    throw new Error("Use /pwclick selector-or-visible-text");
+  }
+  const result = await clickPlaywrightTarget(target);
+  return [
+    "Clicked in Playwright",
+    `Target: ${target}`,
+    `Title: ${result.title || "(untitled)"}`,
+    `URL: ${result.url || "about:blank"}`
+  ].join("\n");
+}
+
+async function playwrightTypeCommand(args) {
+  const [rawTarget, ...rest] = String(args || "").split("|");
+  const target = String(rawTarget || "").trim();
+  const value = rest.join("|").trim();
+  if (!target || !value) {
+    throw new Error("Use /pwtype selector-or-visible-text | text");
+  }
+  const result = await typeIntoPlaywrightTarget(target, value);
+  return [
+    "Typed in Playwright",
+    `Target: ${target}`,
+    `Text: ${value}`,
+    `Title: ${result.title || "(untitled)"}`,
+    `URL: ${result.url || "about:blank"}`
+  ].join("\n");
+}
+
+async function playwrightPressCommand(args) {
+  const key = String(args || "").trim() || "Enter";
+  const result = await pressPlaywrightKey(key);
+  return [
+    "Sent Playwright keypress",
+    `Key: ${key}`,
+    `Title: ${result.title || "(untitled)"}`,
+    `URL: ${result.url || "about:blank"}`
+  ].join("\n");
+}
+
+async function playwrightCloseCommand() {
+  await closePlaywrightSession();
+  return "Closed the Playwright browser session.";
+}
+
+async function showcaseDesktopCommand(roots) {
+  return desktopBrowseCommand("desktop", roots);
+}
+
+async function showcaseWebCommand(token, chatId, roots) {
+  const opened = await playwrightOpenCommand("https://zenai.world", roots);
+  const snapshot = await playwrightSnapshotCommand();
+  const imagePath = await screenshotPlaywrightPage();
+  await sendTelegramDocument(token, chatId, imagePath, `Showcase web capture ${path.basename(imagePath)}`).catch(() => {});
+  return truncateForTelegram([opened, "", snapshot].join("\n\n"));
+}
+
+async function showcaseDocCommand(bot, roots) {
+  return generateDocumentCommand(
+    bot,
+    "Generate a showcase doc that has a bold AI quote, a short futuristic intro, and a link to https://zenai.world.",
+    roots
+  );
+}
+
+async function showcaseTaskCommand(bot, token, chatId) {
+  return startAutopilotTask(
+    bot,
+    token,
+    chatId,
+    "site",
+    "wix",
+    "Audit the current site and create a punchy demo-worthy improvement roadmap with concrete next steps."
+  );
+}
+
+async function showcaseAppsCommand() {
+  const [wix, notion] = await Promise.all([
+    wixSummary().catch((error) => `Wix: ${userFacingErrorMessage(error)}`),
+    notionStatus().catch((error) => `Notion: ${userFacingErrorMessage(error)}`)
+  ]);
+  return truncateForTelegram([
+    "Apps pulse",
+    "",
+    wix,
+    "",
+    notion
+  ].join("\n"));
+}
+
+async function showcaseAiCommand(bot) {
+  const [providers, openclaw] = await Promise.all([
+    Promise.resolve(providersSummary(bot)),
+    openClawStatusCommand().catch((error) => `OpenClaw status\n${userFacingErrorMessage(error)}`)
+  ]);
+  return truncateForTelegram([
+    "AI flex",
+    "",
+    providers,
+    "",
+    openclaw
+  ].join("\n"));
+}
+
+function resolveLaunchSpec(rawTarget, roots) {
+  const target = String(rawTarget || "").trim();
+  if (!target) {
+    throw new Error("Use /launch app-or-path");
+  }
+
+  if (looksLikeLocalPath(target)) {
+    const resolvedPath = resolveAllowedPath(target, roots);
+    return {
+      filePath: resolvedPath,
+      workingDirectory: fs.existsSync(resolvedPath) && fs.statSync(resolvedPath).isDirectory()
+        ? resolvedPath
+        : path.dirname(resolvedPath),
+      description: resolvedPath
+    };
+  }
+
+  const aliases = {
+    explorer: "explorer.exe",
+    "file explorer": "explorer.exe",
+    notepad: "notepad.exe",
+    calculator: "calc.exe",
+    calc: "calc.exe",
+    paint: "mspaint.exe",
+    word: "WINWORD.EXE",
+    excel: "EXCEL.EXE",
+    chrome: "chrome.exe",
+    edge: "msedge.exe",
+    vscode: "Code.exe",
+    code: "Code.exe"
+  };
+  const normalized = target.toLowerCase();
+  const filePath = aliases[normalized] || target;
+  return {
+    filePath,
+    workingDirectory: "",
+    description: filePath
+  };
+}
+
+async function launchDesktopAppCommand(args, roots) {
+  const spec = resolveLaunchSpec(args, roots);
+  const script = [
+    "$ErrorActionPreference = 'Stop'",
+    `$target = ${powerShellLiteral(spec.filePath)}`,
+    `$workingDirectory = ${powerShellLiteral(spec.workingDirectory || "")}`,
+    "$params = @{ FilePath = $target; PassThru = $true }",
+    "if ($workingDirectory) { $params.WorkingDirectory = $workingDirectory }",
+    "$process = Start-Process @params",
+    "$process | Select-Object Id, ProcessName, Path | ConvertTo-Json -Compress"
+  ].join("; ");
+  const result = await shellExec(script, roots[0]);
+  if (result.error || !result.stdout) {
+    throw new Error(result.stderr || result.stdout || `Could not launch ${spec.description}`);
+  }
+
+  const payload = JSON.parse(result.stdout);
+  return [
+    "Launched desktop target",
+    `Target: ${spec.description}`,
+    `Process: ${payload.ProcessName || path.basename(spec.filePath)}`,
+    payload.Id ? `PID: ${payload.Id}` : "",
+    payload.Path ? `Path: ${payload.Path}` : "",
+    "Native Windows app UI control is not claimed here; this confirms launch only."
+  ].filter(Boolean).join("\n");
 }
 
 async function listRecentDocuments(roots, rawPath = "") {
@@ -2186,7 +3184,7 @@ async function listRecentDocuments(roots, rawPath = "") {
   }
 
   if (!items.length) {
-    return "No recent documents yet.\n\nUse /newdoc title | content or /intake name | objective";
+    return "No recent documents yet.\n\nUse /newdoc or /newdoc title | content or /intake name | objective";
   }
 
   const sorted = items.sort((a, b) => b.modifiedAt - a.modifiedAt).slice(0, 20);
@@ -2198,14 +3196,52 @@ async function listRecentDocuments(roots, rawPath = "") {
 }
 
 async function workOnDocumentCommand(bot, token, chatId, roots, args) {
-  const [rawPath, ...rest] = String(args || "").split("|");
-  const targetPath = String(rawPath || "").trim();
-  const objective = rest.join("|").trim();
-  if (!targetPath) {
-    throw new Error("Use /workon path | objective");
+  const [rawPrimary, ...rest] = String(args || "").split("|");
+  const primary = String(rawPrimary || "").trim();
+  let objective = rest.join("|").trim();
+  let targetPath = "";
+
+  const wantsLatestDoc =
+    !primary ||
+    /^(?:doc|document|latest|latest doc|latest document|my latest doc|my latest document|this doc|that doc|work on doc)$/i.test(primary);
+
+  if (primary && objective) {
+    targetPath = primary;
+  } else if (wantsLatestDoc) {
+    targetPath = await defaultAgentTarget(roots, "doc");
+  } else if (
+    looksLikeResolvableLocalPath(primary) ||
+    looksLikeLocalPath(primary) ||
+    primary.includes("\\") ||
+    primary.includes("/") ||
+    /\.[a-z0-9]{1,6}$/i.test(primary)
+  ) {
+    targetPath = primary;
+  } else {
+    targetPath = await defaultAgentTarget(roots, "doc");
+    objective = [primary, objective].filter(Boolean).join(" | ").trim();
   }
+
+  if (!targetPath) {
+    return [
+      "I could not find a recent document to work on yet.",
+      "",
+      "Try one of these:",
+      "- /newdoc",
+      "- /docs",
+      "- /workon desktop\\ZEN Docs\\your-file.md | improve this and make it stronger"
+    ].join("\n");
+  }
+
   const resolved = resolveAllowedPath(targetPath, roots);
-  return startAutopilotTask(bot, token, chatId, "doc", resolved, objective || "Read this document, improve it, and build a strong work pack.");
+  return startAutopilotTask(
+    bot,
+    token,
+    chatId,
+    "doc",
+    resolved,
+    objective || "Read this document, improve it, and build a strong work pack."
+  );
 }
 
 async function extractSpreadsheetText(filePath) {
@@ -2255,10 +3291,10 @@ async function collectAgentSource(bot, roots, type, target) {
     return { title: "Prompt-only task", body: "" };
   }
 
-  if (type === "site" && value.toLowerCase() === "wix") {
+  if (type === "site" && /^(wix|zen world|zenai world|zenai)$/i.test(value)) {
     const [summary, contacts] = await Promise.all([wixSummary(), wixContacts().catch(() => "No recent contacts.")]);
     return {
-      title: "Wix site context",
+      title: value.toLowerCase() === "wix" ? "Wix site context" : value,
       body: `${summary}\n\n${contacts}`.slice(0, TASK_SOURCE_MAX_CHARS)
     };
   }
@@ -2268,6 +3304,18 @@ async function collectAgentSource(bot, roots, type, target) {
     return {
       title: value,
       body: page.slice(0, TASK_SOURCE_MAX_CHARS)
+    };
+  }
+
+  if (!looksLikeResolvableLocalPath(value)) {
+    return {
+      title: value,
+      body: [
+        `User-defined ${type} target: ${value}`,
+        "",
+        `Treat "${value}" as a plain-English assignment target rather than a local file path.`,
+        "Build a useful work pack from general knowledge and connected integrations when relevant."
+      ].join("\n").slice(0, TASK_SOURCE_MAX_CHARS)
     };
   }
 
@@ -2356,7 +3404,10 @@ function capabilitySummaryText(bot) {
     "Remote resiliency: if the local model path fails, the bot can fall back to configured cloud providers for the conversational supervisor flow.",
     `Providers: ${providerLine}`,
     "Best task commands: /docagent, /sheetagent, /siteagent, /supervisor, /delegate, /autopilot, /squad",
-    "Useful controls: /providers, /models, /modeluse, /tasks, /taskstatus, /scheduleadd",
+    "Task behavior: they run in the background and report back here automatically when finished.",
+    "Useful controls: /providers, /openclaw, /models, /modeluse, /tasks, /taskstatus, /scheduleadd",
+    "Desktop controls: /browse for Playwright inspection, /launch for honest app/file launches, /delete for Recycle Bin deletes",
+    "Live browser controls: /playwright, /pwopen, /pwtabs, /pwtab, /pwsnapshot, /pwscreenshot, /pwclick, /pwtype, /pwpress, /pwclose",
     "Core integrations: files, git, network, Wix, Notion, Manus"
   ].join("\n");
 }
@@ -2967,6 +4018,7 @@ async function startAgentTask(bot, token, chatId, type, target, objective) {
     `Target: ${task.target || "prompt only"}`,
     `AI: ${task.providerLabel} | ${task.model || "auto"}`,
     "",
+    "This runs in the background. You do not need to wait here.",
     "I will follow up here in Telegram when the work pack is ready."
   ].join("\n");
 }
@@ -2980,6 +4032,7 @@ async function startDelegatedTask(bot, token, chatId, providerToken, type, targe
     `Target: ${task.target || "prompt only"}`,
     `AI: ${task.providerLabel} | ${task.model || "auto"}`,
     "",
+    "This runs in the background. You can keep chatting or leave Telegram.",
     "I will supervise the task and report back here when it finishes."
   ].join("\n");
 }
@@ -3002,31 +4055,139 @@ async function startSquadTask(bot, token, chatId, type, target, objective) {
     `Supervisor: Ollama local | ${task.model}`,
     `Recommended squad: ${recommendedProfiles(bot, type, 3).map((profile) => profile.label).join(", ")}`,
     "",
+    "This runs in the background. You do not need to stay here.",
     "I will run multiple agents, synthesize the result locally, and follow up here with the final pack."
   ].join("\n");
 }
 
-function parseAgentTaskArgs(args, expectedType = "") {
+async function findLatestFileByExtensions(roots, extensions, preferredFolders = []) {
+  const targets = [];
+  const pushIfExists = (candidate) => {
+    if (candidate && fs.existsSync(candidate) && fs.statSync(candidate).isDirectory()) {
+      targets.push(candidate);
+    }
+  };
+  const desktopRoot = roots.find((root) => root.toLowerCase().endsWith(`${path.sep}desktop`));
+  for (const folder of preferredFolders) {
+    if (desktopRoot) {
+      pushIfExists(path.join(desktopRoot, folder));
+    }
+  }
+  for (const root of roots) {
+    pushIfExists(root);
+  }
+
+  const items = [];
+  const seen = new Set();
+  for (const folder of targets) {
+    const key = folder.toLowerCase();
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    const entries = await fsp.readdir(folder, { withFileTypes: true }).catch(() => []);
+    for (const entry of entries) {
+      if (!entry.isFile()) {
+        continue;
+      }
+      const extension = path.extname(entry.name).toLowerCase();
+      if (!extensions.includes(extension)) {
+        continue;
+      }
+      const fullPath = path.join(folder, entry.name);
+      const stats = await fsp.stat(fullPath).catch(() => null);
+      if (!stats) {
+        continue;
+      }
+      items.push({ fullPath, modifiedAt: stats.mtime.getTime() });
+    }
+  }
+  items.sort((a, b) => b.modifiedAt - a.modifiedAt);
+  return items[0] ? items[0].fullPath : "";
+}
+
+async function defaultAgentTarget(roots, type) {
+  if (type === "site") {
+    return "wix";
+  }
+  if (type === "doc") {
+    return findLatestFileByExtensions(roots, [".md", ".txt", ".pdf", ".docx"], ["ZEN Intake", "ZEN Docs"]);
+  }
+  if (type === "sheet") {
+    return findLatestFileByExtensions(roots, [".xlsx", ".xls", ".csv", ".tsv"], ["ZEN Intake", "ZEN Docs"]);
+  }
+  return roots[0] || "";
+}
+
+function taskCommandUsage(type) {
+  if (type === "doc") {
+    return [
+      "Document agent",
+      "",
+      "Examples:",
+      "/docagent desktop\\ZEN Docs\\brief.md",
+      "/docagent desktop\\ZEN Docs\\brief.md | improve this and build a plan",
+      "Natural: work on my latest doc in the background and report back"
+    ].join("\n");
+  }
+  if (type === "sheet") {
+    return [
+      "Spreadsheet agent",
+      "",
+      "Examples:",
+      "/sheetagent desktop\\sales.xlsx",
+      "/sheetagent desktop\\sales.xlsx | find patterns and recommend actions"
+    ].join("\n");
+  }
+  if (type === "site") {
+    return [
+      "Site agent",
+      "",
+      "Examples:",
+      "/siteagent wix",
+      "/siteagent https://zenai.world",
+      "/siteagent ZEN WORLD | audit the positioning and build an improvement roadmap"
+    ].join("\n");
+  }
+  return [
+    "Task agent",
+    "",
+    "Examples:",
+    "/autopilot general | desktop\\notes.txt | turn this into an execution pack",
+    "/autopilot site | https://zenai.world | audit this site",
+    "Natural: research ZEN WORLD in the background and get back to me"
+  ].join("\n");
+}
+
+async function parseAgentTaskArgs(args, expectedType = "", roots = []) {
   const parts = String(args || "").split("|").map((value) => value.trim());
   if (expectedType) {
     const target = parts[0] || "";
     const objective = parts.slice(1).join(" | ").trim();
     if (!target) {
-      throw new Error(`Use /${expectedType}agent target | objective`);
+      const fallbackTarget = await defaultAgentTarget(roots, expectedType);
+      if (fallbackTarget) {
+        return { type: expectedType, target: fallbackTarget, objective };
+      }
+      throw new Error(taskCommandUsage(expectedType));
     }
     return { type: expectedType, target, objective };
   }
 
   const [type, target, ...rest] = parts;
   const objective = rest.join(" | ").trim();
-  if (!type || !target) {
-    throw new Error("Use /agenttask doc|sheet|site|general | target | objective");
+  if (!type) {
+    throw new Error(taskCommandUsage("general"));
   }
   const normalizedType = type.toLowerCase();
   if (!["doc", "sheet", "site", "general"].includes(normalizedType)) {
     throw new Error("Supported agent types: doc, sheet, site, general");
   }
-  return { type: normalizedType, target, objective };
+  const resolvedTarget = target || await defaultAgentTarget(roots, normalizedType);
+  if (!resolvedTarget) {
+    throw new Error(taskCommandUsage(normalizedType));
+  }
+  return { type: normalizedType, target: resolvedTarget, objective };
 }
 
 function parseDelegateArgs(args) {
@@ -3088,11 +4249,29 @@ async function resendAgentTaskOutputs(bot, token, chatId, idArg) {
 
 function agentHelpText() {
   return [
-    "Agent tasks",
+    "Background task help",
+    "",
+    "These run in the background and report back here when finished.",
+    "",
+    "What to use when:",
+    "- /workon: quickest way to hand your latest document to the bot",
+    "- /docagent: document-specific background work",
+    "- /sheetagent: spreadsheet/data work",
+    "- /siteagent: website or Wix work",
+    "- /autopilot: bot chooses the best provider for the task",
+    "- /squad: multiple providers work and then get synthesized",
+    "",
+    "Quick starts:",
+    "/workon",
+    "/docagent",
+    "/sheetagent",
+    "/siteagent",
+    "/autopilot general | desktop\\notes.txt | turn this into an execution pack",
     "",
     "/providers",
     "/provider openai:project1",
     "/provider anthropic",
+    "/provider openclaw",
     "/provider openrouter",
     "/models",
     "/model gpt-5-mini",
@@ -3100,6 +4279,7 @@ function agentHelpText() {
     "/docagent desktop\\file.txt | build a detailed brief and plan",
     "/sheetagent desktop\\sheet.xlsx | summarize this data and produce actions",
     "/siteagent wix | audit the site and build a roadmap",
+    "/siteagent ZEN WORLD | audit the positioning and build a roadmap",
     "/agenttask general | desktop\\notes.txt | turn this into an execution pack",
     "/supervisor doc | desktop\\file.txt | run a managed work pack",
     "/autopilot doc | desktop\\file.txt | choose the best provider automatically",
@@ -3107,7 +4287,12 @@ function agentHelpText() {
     "/delegate anthropic | doc | desktop\\file.txt | use Claude on this",
     "/tasks",
     "/taskstatus id",
-    "/tasksend id"
+    "/tasksend id",
+    "",
+    "Natural examples:",
+    "research ZEN WORLD in the background and get back to me",
+    "work on my latest doc in the background and report back",
+    "audit https://zenai.world and let me know what to improve"
   ].join("\n");
 }
 
@@ -3137,8 +4322,9 @@ function helpText(bot) {
     "",
     "/start - show this help",
     "/dashboard - open the grouped control dashboard",
+    "/showcase - open the live demo panel with 6 curated wow-factor actions",
     "/menu - show the quick action menu again",
-    "/workbench - open the build-focused tool panel",
+    "/workbench - open the build-focused tool panel with guided next steps",
     "/mode read|build - switch natural-language behavior",
     "/brief - show a compact on-the-go control snapshot",
     "/status - show current laptop bot status",
@@ -3150,10 +4336,30 @@ function helpText(bot) {
     "/fileinfo path - show file details",
     "/read path - read a text file",
     "/viewdoc path - preview a document file",
-    "/newdoc title | optional content - create a markdown document on Desktop",
+    "/newdoc [title] | optional content - create a markdown document on Desktop",
+    "/gendoc prompt - generate a short markdown document from a prompt",
     "/draft title | optional content - create a fast working draft on Desktop",
     "/docs [path] - list recent documents and work folders",
-    "/workon path | objective - send a document into autopilot",
+    "/delete path - send a file or folder to the Windows Recycle Bin",
+    "/browse [desktop|path|url] - inspect a folder, file, or page through Playwright",
+    "/playwright - show Playwright browser help and current session status",
+    "/pwopen url-or-path - open a URL or allowed local file in the live Playwright session",
+    "/pwtabs - list live Playwright tabs",
+    "/pwtab index - switch the active Playwright tab",
+    "/pwsnapshot - inspect the current Playwright page",
+    "/pwscreenshot - capture and send the current Playwright page screenshot",
+    "/pwclick selector-or-text - click in the current Playwright page",
+    "/pwtype selector-or-text | text - type into a field in the current Playwright page",
+    "/pwpress key - send a keyboard key like Enter to the current Playwright page",
+    "/pwclose - close the live Playwright browser session",
+    "/showcasedesktop - demo desktop browsing with Playwright",
+    "/showcaseweb - demo live web opening, snapshotting, and capture",
+    "/showcasedoc - demo fast smart document generation",
+    "/showcasetask - demo a background site agent task",
+    "/showcaseapps - demo live integration status",
+    "/showcaseai - demo the AI provider stack and OpenClaw status",
+    "/launch app-or-path - launch a desktop app, shortcut, file, or folder",
+    "/workon [path | objective] - work on your latest doc, or specify a path and optional objective",
     "/clipboard - show the current text clipboard",
     "/clipboardset text - replace the current text clipboard",
     "/remember title | note - save a quick persistent note for this chat",
@@ -3214,15 +4420,16 @@ function helpText(bot) {
     "/manuslist - list recent Manus tasks",
     "/fetch url - fetch a public webpage",
     "/providers - list configured AI providers",
+    "/openclaw [use] - show OpenClaw status or switch to it",
     "/provider name - switch the active provider profile",
     "/models [provider] - list models for the current or selected provider",
     "/model name - change the active model on the current provider",
     "/modeluse provider | model - switch provider and model together",
     "/capabilities - show the current AI/tools capability map",
     "/agenthelp - show the background agent task workflow",
-    "/docagent path | objective - run a document agent in the background",
-    "/sheetagent path | objective - run a spreadsheet agent in the background",
-    "/siteagent wix|url|path | objective - run a site/app agent in the background",
+    "/docagent [path] | objective - run a document agent in the background",
+    "/sheetagent [path] | objective - run a spreadsheet agent in the background",
+    "/siteagent [wix|url|label] | objective - run a site/app agent in the background",
     "/agenttask type | target | objective - queue a general background task",
     "/supervisor type | target | objective - queue a managed work pack on the current AI selection",
     "/autopilot type | target | objective - automatically choose the best provider for a task",
@@ -3242,8 +4449,15 @@ function helpText(bot) {
 function telegramCommandList() {
   return [
     { command: "start", description: "Open the main help and controls" },
-    { command: "dashboard", description: "Open the grouped control dashboard" },
-    { command: "workbench", description: "Open the build tool panel" },
+     { command: "dashboard", description: "Open the grouped control dashboard" },
+     { command: "showcase", description: "Open the 6-action live demo panel" },
+     { command: "showcasedesktop", description: "Demo desktop browsing with Playwright" },
+     { command: "showcaseweb", description: "Demo live web opening and capture" },
+     { command: "showcasedoc", description: "Demo smart document generation" },
+     { command: "showcasetask", description: "Demo a background site agent" },
+     { command: "showcaseapps", description: "Demo live app integration status" },
+     { command: "showcaseai", description: "Demo the AI provider stack" },
+     { command: "workbench", description: "Open the build tool panel" },
     { command: "mode", description: "Switch read/build behavior" },
     { command: "menu", description: "Show the quick action menu" },
     { command: "brief", description: "Show a compact mobile control snapshot" },
@@ -3251,7 +4465,20 @@ function telegramCommandList() {
     { command: "health", description: "Check runner, Wi-Fi, internet, and Ollama" },
     { command: "files", description: "List files in a folder" },
     { command: "docs", description: "List recent documents and work folders" },
-    { command: "newdoc", description: "Create a markdown document on Desktop" },
+     { command: "newdoc", description: "Create a markdown document on Desktop" },
+     { command: "gendoc", description: "Generate a short document from a prompt" },
+     { command: "browse", description: "Inspect a desktop folder, file, or URL with Playwright" },
+     { command: "playwright", description: "Show Playwright browser help and session status" },
+     { command: "pwopen", description: "Open a URL or file in the live Playwright session" },
+     { command: "pwtabs", description: "List current Playwright tabs" },
+     { command: "pwtab", description: "Switch the active Playwright tab" },
+     { command: "pwsnapshot", description: "Inspect the current Playwright page" },
+     { command: "pwscreenshot", description: "Capture the current Playwright page screenshot" },
+     { command: "pwclick", description: "Click an element in the current Playwright page" },
+     { command: "pwtype", description: "Type into a Playwright page field" },
+     { command: "pwpress", description: "Send a key press to the current Playwright page" },
+     { command: "pwclose", description: "Close the live Playwright session" },
+     { command: "launch", description: "Launch a desktop app, file, folder, or shortcut" },
     { command: "draft", description: "Create a quick working draft document" },
     { command: "workon", description: "Send a document into autopilot" },
     { command: "clipboard", description: "Read the current text clipboard" },
@@ -3259,6 +4486,9 @@ function telegramCommandList() {
     { command: "memories", description: "List saved quick notes for this chat" },
     { command: "remember", description: "Save a quick note for this chat" },
     { command: "forget", description: "Delete one saved quick note" },
+    { command: "delete", description: "Send a file or folder to the Recycle Bin" },
+    { command: "browse", description: "Inspect a folder, file, or page with Playwright" },
+    { command: "launch", description: "Launch a desktop app, file, or folder" },
     { command: "tree", description: "Show a file tree" },
     { command: "project", description: "Summarize the current project" },
     { command: "fileinfo", description: "Show file details" },
@@ -3280,6 +4510,7 @@ function telegramCommandList() {
     { command: "manus", description: "Start a low-cost Manus task" },
     { command: "manuslist", description: "List recent Manus tasks" },
     { command: "providers", description: "List configured AI providers" },
+    { command: "openclaw", description: "Show or switch to OpenClaw" },
     { command: "provider", description: "Switch the active AI provider" },
     { command: "models", description: "List models for the active provider" },
     { command: "modeluse", description: "Switch provider and model together" },
@@ -3380,6 +4611,43 @@ async function executeToolAction(bot, action, roots, state) {
   }
   if (tool === "read_file") {
     return { tool, result: await readFileCommand(action.path || "", roots) };
+  }
+  if (tool === "create_document") {
+    const title = String(action.title || action.name || action.path || "").trim() || "quick-note";
+    const content = String(action.content || "");
+    return { tool, result: await createDocumentCommand(`${title} | ${content}`.trim(), roots) };
+  }
+  if (tool === "desktop_navigate") {
+    return { tool, result: await desktopBrowseCommand(action.target || action.path || action.url || "desktop", roots) };
+  }
+  if (tool === "playwright_open") {
+    return { tool, result: await playwrightOpenCommand(action.target || action.path || action.url || "", roots) };
+  }
+  if (tool === "playwright_tabs") {
+    return { tool, result: await playwrightTabsCommand() };
+  }
+  if (tool === "playwright_snapshot") {
+    return { tool, result: await playwrightSnapshotCommand() };
+  }
+  if (tool === "playwright_click") {
+    return { tool, result: await playwrightClickCommand(action.target || action.selector || action.text || "") };
+  }
+  if (tool === "playwright_type") {
+    const target = action.target || action.selector || action.field || "";
+    const content = String(action.content || action.value || action.text || "");
+    return { tool, result: await playwrightTypeCommand(`${target} | ${content}`) };
+  }
+  if (tool === "playwright_press") {
+    return { tool, result: await playwrightPressCommand(action.key || action.target || "Enter") };
+  }
+  if (tool === "playwright_close") {
+    return { tool, result: await playwrightCloseCommand() };
+  }
+  if (tool === "launch_desktop_app") {
+    return { tool, result: await launchDesktopAppCommand(action.target || action.app || action.path || "", roots) };
+  }
+  if (tool === "delete_path") {
+    return { tool, result: await deletePathCommand(action.path || action.target || "", roots) };
   }
   if (tool === "write_file") {
     if (currentChatMode(state) !== "build") {
@@ -3495,6 +4763,7 @@ function buildPlannerPrompt(bot, roots, state, userText) {
       ]
     : [
         "- This planner is read-only by default. Do not write files, create folders, or run arbitrary commands.",
+        "- You may still use create_document, desktop_navigate, launch_desktop_app, and delete_path when the user directly asks for those bounded actions.",
         "- For risky or state-changing requests, reply with guidance instead of taking action."
       ];
 
@@ -3516,6 +4785,17 @@ function buildPlannerPrompt(bot, roots, state, userText) {
     "- find_files with pattern and optional path",
     "- grep_files with pattern and optional path",
     "- read_file with path",
+    "- create_document with title and optional content",
+    "- desktop_navigate with target (desktop path or url) to inspect a folder, file, or webpage via Playwright",
+    "- playwright_open with target/url to open a page or allowed local file in the live Playwright browser session",
+    "- playwright_tabs to list the current Playwright browser tabs",
+    "- playwright_snapshot to inspect the current Playwright page text and controls",
+    "- playwright_click with target text or selector to click an element in the current Playwright page",
+    "- playwright_type with target text or selector and content/value to fill a field in the current Playwright page",
+    "- playwright_press with key to send a keyboard key like Enter in the current Playwright page",
+    "- playwright_close to close the Playwright browser session",
+    "- launch_desktop_app with target to start a desktop app, shortcut, folder, or file",
+    "- delete_path with target to send a file or folder to the Windows Recycle Bin",
     "- file_info with path",
     "- git_status",
     "- git_log",
@@ -3541,6 +4821,8 @@ function buildPlannerPrompt(bot, roots, state, userText) {
     "- Return only valid JSON.",
     "- Use at most 3 tool actions.",
     "- Prefer a normal reply when the user is chatting casually.",
+    "- For file creation, deletion, folder navigation, desktop browsing, or app launching, use the exact tool instead of pretending the action happened.",
+    "- Use Playwright tools for browser page work, web forms, and tab inspection. Do not claim Playwright controls arbitrary native Windows app UIs.",
     "- You know the slash commands, models, providers, and task workflows available in this bot. If the user asks how to do something, suggest the most relevant command or agent path.",
     "- qwen2.5-coder on local Ollama is the default supervisor model unless the user explicitly wants another provider or model.",
     "- For document workflows, remember the simpler commands: /newdoc, /docs, /viewdoc, /workon, /autopilot, /squad.",
@@ -3549,7 +4831,7 @@ function buildPlannerPrompt(bot, roots, state, userText) {
     "- If the request is unsafe or unclear, reply instead of taking actions.",
     "",
     "JSON schema:",
-    '{"mode":"reply"|"act","reply":"string","actions":[{"tool":"tool_name","path":"optional","content":"optional","command":"optional","prompt":"optional","message":"optional"}]}',
+    '{"mode":"reply"|"act","reply":"string","actions":[{"tool":"tool_name","path":"optional","target":"optional","url":"optional","title":"optional","content":"optional","value":"optional","key":"optional","selector":"optional","index":"optional","command":"optional","prompt":"optional","message":"optional"}]}',
     "",
     history ? `Recent conversation:\n${history}\n` : "Recent conversation:\n(none)\n",
     `Latest user message:\n${userText}`
@@ -3576,6 +4858,92 @@ function buildFinalResponsePrompt(bot, state, userText, toolResults) {
     "Write a short natural-language reply for Telegram.",
     "Mention what you did, any important output, and any next step if needed."
   ].join("\n");
+}
+
+function commandUsageHelp(command) {
+  if (command === "workon") {
+    return [
+      "Try one of these:",
+      "- /workon",
+      "- /workon improve the latest doc and tighten the writing",
+      "- /workon desktop\\ZEN Docs\\brief.md | improve this and build a plan"
+    ].join("\n");
+  }
+  if (command === "workbench") {
+    return [
+      "Workbench is the build panel.",
+      "Good first taps: New Doc, Work Latest Doc, Ideas, Plan, Doc Agent, Site Agent."
+    ].join("\n");
+  }
+  if (command === "docagent" || command === "sheetagent" || command === "siteagent") {
+    return agentHelpText();
+  }
+  if (command === "html" || command === "component" || command === "route" || command === "spec") {
+    return [
+      "This command needs both a file path and a prompt.",
+      `Example: /${command} some\\path${command === "component" ? ".tsx" : command === "route" ? ".ts" : command === "html" ? ".html" : ".md"} | describe what to build`
+    ].join("\n");
+  }
+  if (command === "delete") {
+    return [
+      "Examples:",
+      "- /delete desktop\\ZEN Docs\\old-note.md",
+      "- paste multiple quoted paths after /delete"
+    ].join("\n");
+  }
+  if (command === "browse") {
+    return [
+      "Examples:",
+      "- /browse desktop",
+      "- /browse desktop\\ZEN Docs",
+      "- /browse https://zenai.world"
+    ].join("\n");
+  }
+  if (command === "playwright" || command === "pwopen" || command === "pwsnapshot" || command === "pwscreenshot" || command === "pwclick" || command === "pwtype" || command === "pwpress") {
+    return [
+      "Playwright quick examples:",
+      "- /pwopen https://zenai.world",
+      "- /pwsnapshot",
+      "- /pwclick Sign in",
+      "- /pwtype Search | zenai"
+    ].join("\n");
+  }
+  return "";
+}
+
+function toolResultFailed(result) {
+  return /^Error:/i.test(String(result && result.result || "").trim());
+}
+
+function shouldUseDeterministicToolReply(toolResults) {
+  const exactResultTools = new Set([
+    "create_document",
+    "write_file",
+    "append_file",
+    "make_dir",
+    "replace_in_file",
+    "run_command",
+    "desktop_navigate",
+    "playwright_open",
+    "playwright_tabs",
+    "playwright_snapshot",
+    "playwright_click",
+    "playwright_type",
+    "playwright_press",
+    "playwright_close",
+    "launch_desktop_app",
+    "delete_path"
+  ]);
+  return toolResults.some((result) => exactResultTools.has(result.tool) || toolResultFailed(result));
+}
+
+function deterministicToolReply(toolResults) {
+  return truncateForTelegram(
+    toolResults
+      .map((result) => String(result.result || "").trim())
+      .filter(Boolean)
+      .join("\n\n")
+  );
 }
 
 async function handleDirectChat(bot, userText, state) {
@@ -3645,6 +5013,10 @@ async function handleNaturalLanguage(bot, userText, roots, state) {
         result: `Error: ${error.message || String(error)}`
       });
     }
+  }
+
+  if (shouldUseDeterministicToolReply(toolResults)) {
+    return deterministicToolReply(toolResults);
   }
 
   const finalResponse = await askModel(
@@ -3813,8 +5185,11 @@ async function executeTelegramCommand(bot, token, command, args, roots, chatId) 
   if (command === "menu" || command === "dashboard") {
     return { text: dashboardText(bot), extra: { reply_markup: dashboardInlineKeyboard() } };
   }
+  if (command === "showcase") {
+    return { text: showcaseText(bot), extra: { reply_markup: showcaseInlineKeyboard() } };
+  }
   if (command === "workbench") {
-    return { text: `Build workbench\nCurrent mode: ${currentChatMode(state)}`, extra: { reply_markup: buildInlineKeyboard() } };
+    return { text: `${workbenchText(bot)}\n\nCurrent mode: ${currentChatMode(state)}`, extra: { reply_markup: buildInlineKeyboard() } };
   }
   if (command === "mode") {
     const nextMode = String(args || "").trim().toLowerCase();
@@ -3838,7 +5213,15 @@ async function executeTelegramCommand(bot, token, command, args, roots, chatId) 
     };
   }
   if (command === "health") {
-    return { text: await healthSummary(bot, roots), extra: replyMarkupForCommand(command) };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await healthSummary(bot, roots), extra: replyMarkupForCommand(command) }),
+      { label: "Health check" }
+    );
   }
   if (command === "roots") {
     return {
@@ -3850,7 +5233,15 @@ async function executeTelegramCommand(bot, token, command, args, roots, chatId) 
     return { text: await listFiles(args, roots), extra: replyMarkupForCommand(command) };
   }
   if (command === "brief") {
-    return { text: await mobileBrief(bot, chatId, roots), extra: replyMarkupForCommand(command) };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await mobileBrief(bot, chatId, roots), extra: replyMarkupForCommand(command) }),
+      { label: "Brief" }
+    );
   }
   if (command === "docs") {
     return { text: await listRecentDocuments(roots, args), extra: replyMarkupForCommand(command) };
@@ -3859,7 +5250,15 @@ async function executeTelegramCommand(bot, token, command, args, roots, chatId) 
     return { text: await treeFiles(args, roots), extra: replyMarkupForCommand(command) };
   }
   if (command === "project") {
-    return { text: await projectOverview(roots), extra: replyMarkupForCommand(command) };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await projectOverview(roots), extra: replyMarkupForCommand(command) }),
+      { label: "Project overview" }
+    );
   }
   if (command === "find") {
     return { text: await findFiles(args, roots), extra: replyMarkupForCommand(command) };
@@ -3879,8 +5278,172 @@ async function executeTelegramCommand(bot, token, command, args, roots, chatId) 
   if (command === "newdoc") {
     return { text: await createDocumentCommand(args, roots), extra: replyMarkupForCommand(command) };
   }
+  if (command === "gendoc") {
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await generateDocumentCommand(bot, args, roots), extra: replyMarkupForCommand("newdoc") }),
+      { replyCommand: "newdoc", label: "Generated document" }
+    );
+  }
   if (command === "quickdoc" || command === "draft") {
     return { text: await createDocumentCommand(args, roots), extra: replyMarkupForCommand("newdoc") };
+  }
+  if (command === "delete" || command === "trash") {
+    return { text: await deletePathCommand(args, roots), extra: replyMarkupForCommand("files") };
+  }
+  if (command === "browse") {
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await desktopBrowseCommand(args, roots), extra: replyMarkupForCommand("files") }),
+      { replyCommand: "files", label: "Browse request" }
+    );
+  }
+  if (command === "showcasedesktop") {
+    return { text: await showcaseDesktopCommand(roots), extra: replyMarkupForCommand("showcase") };
+  }
+  if (command === "showcaseweb") {
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await showcaseWebCommand(token, chatId, roots), extra: replyMarkupForCommand("showcase") }),
+      { replyCommand: "showcase", label: "Showcase web demo" }
+    );
+  }
+  if (command === "showcasedoc") {
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await showcaseDocCommand(bot, roots), extra: replyMarkupForCommand("showcase") }),
+      { replyCommand: "showcase", label: "Showcase document" }
+    );
+  }
+  if (command === "showcasetask") {
+    return { text: await showcaseTaskCommand(bot, token, chatId), extra: replyMarkupForCommand("showcase") };
+  }
+  if (command === "showcaseapps") {
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await showcaseAppsCommand(), extra: replyMarkupForCommand("showcase") }),
+      { replyCommand: "showcase", label: "Apps pulse" }
+    );
+  }
+  if (command === "showcaseai") {
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await showcaseAiCommand(bot), extra: replyMarkupForCommand("showcase") }),
+      { replyCommand: "showcase", label: "AI flex" }
+    );
+  }
+  if (command === "playwright") {
+    return { text: await playwrightHelpCommand(), extra: replyMarkupForCommand("playwright") };
+  }
+  if (command === "pwopen") {
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await playwrightOpenCommand(args, roots), extra: replyMarkupForCommand("playwright") }),
+      { replyCommand: "playwright", label: "Playwright open" }
+    );
+  }
+  if (command === "pwtabs") {
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await playwrightTabsCommand(), extra: replyMarkupForCommand("playwright") }),
+      { replyCommand: "playwright", label: "Playwright tabs" }
+    );
+  }
+  if (command === "pwtab") {
+    return { text: await playwrightTabCommand(args), extra: replyMarkupForCommand("playwright") };
+  }
+  if (command === "pwsnapshot") {
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await playwrightSnapshotCommand(), extra: replyMarkupForCommand("playwright") }),
+      { replyCommand: "playwright", label: "Playwright snapshot" }
+    );
+  }
+  if (command === "pwscreenshot") {
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await playwrightScreenshotCommand(token, chatId), extra: replyMarkupForCommand("playwright") }),
+      { replyCommand: "playwright", label: "Playwright screenshot" }
+    );
+  }
+  if (command === "pwclick") {
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await playwrightClickCommand(args), extra: replyMarkupForCommand("playwright") }),
+      { replyCommand: "playwright", label: "Playwright click" }
+    );
+  }
+  if (command === "pwtype") {
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await playwrightTypeCommand(args), extra: replyMarkupForCommand("playwright") }),
+      { replyCommand: "playwright", label: "Playwright type" }
+    );
+  }
+  if (command === "pwpress") {
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await playwrightPressCommand(args), extra: replyMarkupForCommand("playwright") }),
+      { replyCommand: "playwright", label: "Playwright keypress" }
+    );
+  }
+  if (command === "pwclose") {
+    return { text: await playwrightCloseCommand(), extra: replyMarkupForCommand("playwright") };
+  }
+  if (command === "launch") {
+    return { text: await launchDesktopAppCommand(args, roots), extra: replyMarkupForCommand("menu") };
   }
   if (command === "workon") {
     return { text: await workOnDocumentCommand(bot, token, chatId, roots, args), extra: replyMarkupForCommand("tasks") };
@@ -3922,19 +5485,59 @@ async function executeTelegramCommand(bot, token, command, args, roots, chatId) 
     };
   }
   if (command === "ask") {
-    return { text: truncateForTelegram(await askModel(bot, args)), extra: replyMarkupForCommand(command) };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: truncateForTelegram(await askModel(bot, args)), extra: replyMarkupForCommand(command) }),
+      { label: "AI reply" }
+    );
   }
   if (command === "ideas") {
-    return { text: await ideasCommand(bot, args), extra: replyMarkupForCommand("workbench") };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await ideasCommand(bot, args), extra: replyMarkupForCommand("workbench") }),
+      { replyCommand: "workbench", label: "Ideas" }
+    );
   }
   if (command === "brainstorm") {
-    return { text: await ideasCommand(bot, args), extra: replyMarkupForCommand("workbench") };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await ideasCommand(bot, args), extra: replyMarkupForCommand("workbench") }),
+      { replyCommand: "workbench", label: "Brainstorm" }
+    );
   }
   if (command === "planbuild") {
-    return { text: await planBuildCommand(bot, args), extra: replyMarkupForCommand("workbench") };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await planBuildCommand(bot, args), extra: replyMarkupForCommand("workbench") }),
+      { replyCommand: "workbench", label: "Build plan" }
+    );
   }
   if (command === "outline") {
-    return { text: await planBuildCommand(bot, args), extra: replyMarkupForCommand("workbench") };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await planBuildCommand(bot, args), extra: replyMarkupForCommand("workbench") }),
+      { replyCommand: "workbench", label: "Outline" }
+    );
   }
   if (command === "intake") {
     const intake = await startIntakeSession(args, roots);
@@ -3954,61 +5557,117 @@ async function executeTelegramCommand(bot, token, command, args, roots, chatId) 
     return { text: "Intake session cancelled.", extra: replyMarkupForCommand("workbench"), state };
   }
   if (command === "analyze") {
-    return { text: await analyzeFileCommand(bot, roots, args), extra: replyMarkupForCommand("workbench") };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await analyzeFileCommand(bot, roots, args), extra: replyMarkupForCommand("workbench") }),
+      { replyCommand: "workbench", label: "Analysis" }
+    );
   }
   if (command === "summarize") {
-    return { text: await analyzeFileCommand(bot, roots, args), extra: replyMarkupForCommand("workbench") };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await analyzeFileCommand(bot, roots, args), extra: replyMarkupForCommand("workbench") }),
+      { replyCommand: "workbench", label: "Summary" }
+    );
   }
   if (command === "casepack") {
-    return { text: await analyzeFileCommand(bot, roots, args), extra: replyMarkupForCommand("workbench") };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await analyzeFileCommand(bot, roots, args), extra: replyMarkupForCommand("workbench") }),
+      { replyCommand: "workbench", label: "Case pack" }
+    );
   }
   if (command === "html") {
-    return {
-      text: await writeGeneratedArtifact(
-        bot,
-        roots,
-        args,
-        "Return only a complete HTML document with inline CSS and JS. No markdown fences.",
-        "html"
-      ),
-      extra: replyMarkupForCommand("workbench")
-    };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({
+        text: await writeGeneratedArtifact(
+          bot,
+          roots,
+          args,
+          "Return only a complete HTML document with inline CSS and JS. No markdown fences.",
+          "html"
+        ),
+        extra: replyMarkupForCommand("workbench")
+      }),
+      { replyCommand: "workbench", label: "HTML artifact" }
+    );
   }
   if (command === "component") {
-    return {
-      text: await writeGeneratedArtifact(
-        bot,
-        roots,
-        args,
-        "Return only a React TSX component file. No markdown fences. Keep it production-ready.",
-        "component"
-      ),
-      extra: replyMarkupForCommand("workbench")
-    };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({
+        text: await writeGeneratedArtifact(
+          bot,
+          roots,
+          args,
+          "Return only a React TSX component file. No markdown fences. Keep it production-ready.",
+          "component"
+        ),
+        extra: replyMarkupForCommand("workbench")
+      }),
+      { replyCommand: "workbench", label: "Component artifact" }
+    );
   }
   if (command === "route") {
-    return {
-      text: await writeGeneratedArtifact(
-        bot,
-        roots,
-        args,
-        "Return only a Next.js route handler in TypeScript. No markdown fences.",
-        "route"
-      ),
-      extra: replyMarkupForCommand("workbench")
-    };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({
+        text: await writeGeneratedArtifact(
+          bot,
+          roots,
+          args,
+          "Return only a Next.js route handler in TypeScript. No markdown fences.",
+          "route"
+        ),
+        extra: replyMarkupForCommand("workbench")
+      }),
+      { replyCommand: "workbench", label: "Route artifact" }
+    );
   }
   if (command === "spec") {
-    return {
-      text: await writeGeneratedArtifact(
-        bot,
-        roots,
-        args,
-        "Return only markdown. Write a concise but strong project specification.",
-        "spec"
-      ),
-      extra: replyMarkupForCommand("workbench")
-    };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({
+        text: await writeGeneratedArtifact(
+          bot,
+          roots,
+          args,
+          "Return only markdown. Write a concise but strong project specification.",
+          "spec"
+        ),
+        extra: replyMarkupForCommand("workbench")
+      }),
+      { replyCommand: "workbench", label: "Specification artifact" }
+    );
   }
   if (command === "replace") {
     return { text: await replaceInFileCommand(args, roots), extra: replyMarkupForCommand("workbench") };
@@ -4056,58 +5715,219 @@ async function executeTelegramCommand(bot, token, command, args, roots, chatId) 
     return { text: await scanCommonPorts(args), extra: replyMarkupForCommand(command) };
   }
   if (command === "wix") {
-    return { text: await wixSummary(), extra: replyMarkupForCommand(command) };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await wixSummary(), extra: replyMarkupForCommand(command) }),
+      { label: "Wix summary" }
+    );
   }
   if (command === "wixcontacts") {
-    return { text: await wixContacts(), extra: replyMarkupForCommand(command) };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await wixContacts(), extra: replyMarkupForCommand(command) }),
+      { label: "Wix contacts" }
+    );
   }
   if (command === "notionstatus") {
-    return { text: await notionStatus(), extra: replyMarkupForCommand(command) };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await notionStatus(), extra: replyMarkupForCommand(command) }),
+      { label: "Notion status" }
+    );
   }
   if (command === "notionsearch") {
-    return { text: await notionSearchCommand(args), extra: replyMarkupForCommand(command) };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await notionSearchCommand(args), extra: replyMarkupForCommand(command) }),
+      { label: "Notion search" }
+    );
   }
   if (command === "notionopen") {
-    return { text: await notionOpenCommand(args), extra: replyMarkupForCommand(command) };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await notionOpenCommand(args), extra: replyMarkupForCommand(command) }),
+      { label: "Notion open" }
+    );
   }
   if (command === "notionpage") {
-    return { text: await notionPageCommand(args), extra: replyMarkupForCommand(command) };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await notionPageCommand(args), extra: replyMarkupForCommand(command) }),
+      { label: "Notion page" }
+    );
   }
   if (command === "notionappend") {
-    return { text: await notionAppendCommand(args), extra: replyMarkupForCommand(command) };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await notionAppendCommand(args), extra: replyMarkupForCommand(command) }),
+      { label: "Notion append" }
+    );
   }
   if (command === "notionappendto") {
-    return { text: await notionAppendToMatchCommand(args), extra: replyMarkupForCommand(command) };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await notionAppendToMatchCommand(args), extra: replyMarkupForCommand(command) }),
+      { label: "Notion append" }
+    );
   }
   if (command === "notioncreate") {
-    return { text: await notionCreateCommand(args), extra: replyMarkupForCommand(command) };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await notionCreateCommand(args), extra: replyMarkupForCommand(command) }),
+      { label: "Notion create" }
+    );
   }
   if (command === "notioncreatein") {
-    return { text: await notionCreateInMatchCommand(args), extra: replyMarkupForCommand(command) };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await notionCreateInMatchCommand(args), extra: replyMarkupForCommand(command) }),
+      { label: "Notion create" }
+    );
   }
   if (command === "notionquery") {
-    return { text: await notionQueryCommand(args), extra: replyMarkupForCommand(command) };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await notionQueryCommand(args), extra: replyMarkupForCommand(command) }),
+      { label: "Notion query" }
+    );
   }
   if (command === "notionusers") {
-    return { text: await notionUsersCommand(), extra: replyMarkupForCommand(command) };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await notionUsersCommand(), extra: replyMarkupForCommand(command) }),
+      { label: "Notion users" }
+    );
   }
   if (command === "manus") {
-    return { text: await manusTaskCommand(args), extra: replyMarkupForCommand(command) };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await manusTaskCommand(args), extra: replyMarkupForCommand(command) }),
+      { label: "Manus task" }
+    );
   }
   if (command === "manusnotion") {
-    return { text: await manusNotionTaskCommand(args), extra: replyMarkupForCommand(command) };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await manusNotionTaskCommand(args), extra: replyMarkupForCommand(command) }),
+      { label: "Manus Notion task" }
+    );
   }
   if (command === "manusstatus") {
-    return { text: await manusStatusCommand(args), extra: replyMarkupForCommand(command) };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await manusStatusCommand(args), extra: replyMarkupForCommand(command) }),
+      { label: "Manus status" }
+    );
   }
   if (command === "manuslist") {
-    return { text: await manusListCommand(), extra: replyMarkupForCommand(command) };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await manusListCommand(), extra: replyMarkupForCommand(command) }),
+      { label: "Manus list" }
+    );
   }
   if (command === "fetch") {
-    return { text: await fetchWebPage(args), extra: replyMarkupForCommand(command) };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await fetchWebPage(args), extra: replyMarkupForCommand(command) }),
+      { label: "Fetch" }
+    );
   }
   if (command === "providers") {
     return { text: providersSummary(bot), extra: replyMarkupForCommand(command) };
+  }
+  if (command === "openclaw") {
+    if (/^(use|on|switch)\b/i.test(String(args || "").trim())) {
+      const profile = findProfile(bot, "openclaw");
+      if (!profile) {
+        throw new Error("OpenClaw is not configured here.");
+      }
+      const listed = await listProviderModels(bot, { profileId: profile.id });
+      const modelName = pickCheapestUsefulModel(profile.provider, listed.models);
+      const updatedBot = await updateBotAiSettings(bot.id, {
+        aiProviderId: profile.id,
+        modelName: modelName || ""
+      });
+      Object.assign(bot, updatedBot);
+      return { text: `Active provider changed to ${profile.label}\nModel: ${modelName || "auto"}`, extra: replyMarkupForCommand("openclaw") };
+    }
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await openClawStatusCommand(), extra: replyMarkupForCommand("openclaw") }),
+      { replyCommand: "openclaw", label: "OpenClaw status" }
+    );
   }
   if (command === "capabilities") {
     return { text: capabilitySummaryText(bot), extra: replyMarkupForCommand(command) };
@@ -4115,7 +5935,7 @@ async function executeTelegramCommand(bot, token, command, args, roots, chatId) 
   if (command === "provider") {
     const profile = findProfile(bot, args);
     if (!profile) {
-      throw new Error("Use /provider ollama, /provider cohere, /provider anthropic, /provider openrouter, or /provider openai:project1");
+      throw new Error("Use /provider ollama, /provider openclaw, /provider cohere, /provider anthropic, /provider openrouter, or /provider openai:project1");
     }
     const listed = await listProviderModels(bot, { profileId: profile.id });
     const modelName = pickCheapestUsefulModel(profile.provider, listed.models);
@@ -4127,7 +5947,15 @@ async function executeTelegramCommand(bot, token, command, args, roots, chatId) 
     return { text: `Active provider changed to ${profile.label}\nModel: ${modelName || "auto"}`, extra: replyMarkupForCommand(command) };
   }
   if (command === "models") {
-    return { text: await listModels(bot, args), extra: replyMarkupForCommand(command) };
+    return maybeDetachCommand(
+      bot,
+      token,
+      chatId,
+      command,
+      args,
+      async () => ({ text: await listModels(bot, args), extra: replyMarkupForCommand(command) }),
+      { label: "Model list" }
+    );
   }
   if (command === "model") {
     if (!args) {
@@ -4159,31 +5987,31 @@ async function executeTelegramCommand(bot, token, command, args, roots, chatId) 
     return { text: agentHelpText(), extra: replyMarkupForCommand(command) };
   }
   if (command === "docagent") {
-    const parsed = parseAgentTaskArgs(args, "doc");
+    const parsed = await parseAgentTaskArgs(args, "doc", roots);
     return { text: await startAgentTask(bot, token, chatId, parsed.type, parsed.target, parsed.objective), extra: replyMarkupForCommand("tasks") };
   }
   if (command === "sheetagent") {
-    const parsed = parseAgentTaskArgs(args, "sheet");
+    const parsed = await parseAgentTaskArgs(args, "sheet", roots);
     return { text: await startAgentTask(bot, token, chatId, parsed.type, parsed.target, parsed.objective), extra: replyMarkupForCommand("tasks") };
   }
   if (command === "siteagent") {
-    const parsed = parseAgentTaskArgs(args, "site");
+    const parsed = await parseAgentTaskArgs(args, "site", roots);
     return { text: await startAgentTask(bot, token, chatId, parsed.type, parsed.target, parsed.objective), extra: replyMarkupForCommand("tasks") };
   }
   if (command === "agenttask") {
-    const parsed = parseAgentTaskArgs(args);
+    const parsed = await parseAgentTaskArgs(args, "", roots);
     return { text: await startAgentTask(bot, token, chatId, parsed.type, parsed.target, parsed.objective), extra: replyMarkupForCommand("tasks") };
   }
   if (command === "supervisor") {
-    const parsed = parseAgentTaskArgs(args);
+    const parsed = await parseAgentTaskArgs(args, "", roots);
     return { text: await startAgentTask(bot, token, chatId, parsed.type, parsed.target, parsed.objective), extra: replyMarkupForCommand("tasks") };
   }
   if (command === "autopilot") {
-    const parsed = parseAgentTaskArgs(args);
+    const parsed = await parseAgentTaskArgs(args, "", roots);
     return { text: await startAutopilotTask(bot, token, chatId, parsed.type, parsed.target, parsed.objective), extra: replyMarkupForCommand("tasks") };
   }
   if (command === "squad") {
-    const parsed = parseAgentTaskArgs(args);
+    const parsed = await parseAgentTaskArgs(args, "", roots);
     return { text: await startSquadTask(bot, token, chatId, parsed.type, parsed.target, parsed.objective), extra: replyMarkupForCommand("tasks") };
   }
   if (command === "delegate") {
@@ -4253,7 +6081,10 @@ async function handleCallbackQuery(bot, token, callbackQuery) {
     } else if (data.startsWith("cmd:")) {
       const commandText = data.slice(4).trim();
       const { command, args } = splitCommand(commandText.startsWith("/") ? commandText : `/${commandText}`);
-      response = await executeTelegramCommand(bot, token, command, args, roots, chatId);
+      response = await withActionTimeout(
+        executeTelegramCommand(bot, token, command, args, roots, chatId),
+        `The /${command} button action took too long. Try the slash command directly.`
+      );
     } else {
       response = { text: "That button action is not wired yet.", extra: replyMarkupForCommand("menu", true) };
     }
@@ -4267,11 +6098,22 @@ async function handleCallbackQuery(bot, token, callbackQuery) {
       await sendTelegramText(token, chatId, response.text, response.extra || replyMarkupForCommand("menu"));
     });
   } catch (error) {
+    const fallbackCommand =
+      data && data.startsWith("cmd:")
+        ? splitCommand(data.slice(4).trim().startsWith("/") ? data.slice(4).trim() : `/${data.slice(4).trim()}`).command
+        : "";
+    const help = commandUsageHelp(fallbackCommand);
     await telegram(token, "answerCallbackQuery", {
       callback_query_id: callbackQuery.id,
       text: error.message || "Action failed.",
       show_alert: false
     }).catch(() => {});
+    await sendTelegramText(
+      token,
+      chatId,
+      [`Error: ${userFacingErrorMessage(error)}`, help ? `\n${help}` : ""].join("\n"),
+      fallbackCommand ? replyMarkupForCommand(fallbackCommand) : replyMarkupForCommand("menu")
+    ).catch(() => {});
   } finally {
     INFLIGHT_CHAT_KEYS.delete(inflightKey);
   }
@@ -4305,7 +6147,10 @@ async function handleMessage(bot, token, message) {
       extra = replyMarkupForCommand("workbench");
     } else if (text.startsWith("/")) {
       const { command, args } = splitCommand(text);
-      const response = await executeTelegramCommand(bot, token, command, args, roots, chatId);
+      const response = await withActionTimeout(
+        executeTelegramCommand(bot, token, command, args, roots, chatId),
+        `/${command} took too long. Please try again.`
+      );
       reply = response.text;
       extra = response.extra || {};
       if (response.state) {
@@ -4314,7 +6159,10 @@ async function handleMessage(bot, token, message) {
     } else {
       const quickIntent = parseQuickIntent(text);
       if (quickIntent) {
-        const response = await executeTelegramCommand(bot, token, quickIntent.command, quickIntent.args, roots, chatId);
+        const response = await withActionTimeout(
+          executeTelegramCommand(bot, token, quickIntent.command, quickIntent.args, roots, chatId),
+          `That action took too long. Try the matching slash command if it keeps happening.`
+        );
         reply = response.text;
         extra = response.extra || {};
         if (response.state) {
@@ -4322,7 +6170,10 @@ async function handleMessage(bot, token, message) {
         }
       } else {
         state = pushChatMessage(state, "user", text);
-        reply = await handleNaturalLanguage(bot, text, roots, state);
+        reply = await withActionTimeout(
+          handleNaturalLanguage(bot, text, roots, state),
+          "That request took too long. Try a simpler phrasing or a direct slash command."
+        );
         extra = replyMarkupForCommand("menu");
       }
     }
@@ -4333,7 +6184,14 @@ async function handleMessage(bot, token, message) {
   } catch (error) {
     await appendRunnerLog(bot.id, `message error chat=${chatId} text=${JSON.stringify(text).slice(0, 400)} error=${error.stack || error.message || String(error)}`);
     if (!isRateLimitError(error)) {
-      await sendTelegramText(token, chatId, `Error: ${userFacingErrorMessage(error)}`).catch(() => {});
+      const failedCommand = text.startsWith("/") ? splitCommand(text).command : "";
+      const help = commandUsageHelp(failedCommand);
+      await sendTelegramText(
+        token,
+        chatId,
+        [`Error: ${userFacingErrorMessage(error)}`, help ? `\n${help}` : ""].join("\n"),
+        failedCommand ? replyMarkupForCommand(failedCommand) : replyMarkupForCommand("menu")
+      ).catch(() => {});
     } else {
       await appendRunnerLog(bot.id, `rate-limit suppress chat=${chatId} retryAfterMs=${retryAfterMs(error)}`);
     }
@@ -4364,6 +6222,7 @@ async function ensureDirs() {
   await fsp.mkdir(STORAGE_DIR, { recursive: true });
   await fsp.mkdir(LOG_DIR, { recursive: true });
   await fsp.mkdir(CHAT_DIR, { recursive: true });
+  await fsp.mkdir(PLAYWRIGHT_DIR, { recursive: true });
   if (!fs.existsSync(SCHEDULES_FILE)) {
     await writeSchedules([]);
   }
